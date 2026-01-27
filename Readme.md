@@ -52,9 +52,9 @@ To adjust the TTN Credentials in the Sketch:
 
 ## Retrieving data on The Things Network
 
-The sketch sends **Cayenne LPP** ([Cayenne Low Power Payload](https://docs.mydevices.com/docs/lorawan/cayenne-lpp)): channel 0 = Unix timestamp (seconds since Epoch, custom type 128, 4 bytes MSB first), channel 1 = battery voltage in V (Analog Input, 0.01 resolution), channel 2 = DS18B20 temperature (Digital Input, 1 byte): 0 = error, 1 = &lt;0°C, 2 = &gt;30°C, 3–255 = temperature °C encoded as `(byte−3)/8.43` (~0.118°C/step over 0–30°C). Time is kept by the RTC (RTCZero) across sleep; epoch is persisted in flash and restored after power loss. Set `RTC_DEFAULT_EPOCH` in the sketch to current Unix time at flash time, or leave 0 until time is set (e.g. via downlink). Session is saved on join and restored on wake so the device can skip join when possible. Sleep interval: 30 s in development (`USE_DEV_SLEEP 1`), 6 h in production (`USE_DEV_SLEEP 0`).
+The sketch sends **Cayenne LPP** ([Cayenne Low Power Payload](https://docs.mydevices.com/docs/lorawan/cayenne-lpp)): channel 0 = Unix timestamp (seconds since Epoch, custom type 128, 4 bytes MSB first), channel 1 = battery voltage in V (Analog Input, 0.01 resolution), channel 2 = DS18B20 temperature (Digital Input, 1 byte): 0 = error, 1 = &lt;0°C, 2 = &gt;30°C, 3–255 = temperature °C encoded as `(byte−3)/8.43` (~0.118°C/step over 0–30°C). Time is kept by the RTC (RTCZero) across sleep; epoch is persisted in flash and restored after power loss. **RTC is synced from the network** via LoRaWAN DeviceTimeReq/DeviceTimeAns: the first request is sent after EV_JOINED, then at most once per 24 hours (TTN fair use). This requires an LMIC library that supports LoRaWAN 1.0.3 and DeviceTimeReq (e.g. [MCCI LoRaWAN LMIC](https://github.com/mcci-catena/arduino-lmic)); ensure `LMIC_ENABLE_DeviceTimeReq` is enabled in the LMIC project config. If no network time is available, set `RTC_DEFAULT_EPOCH` in the sketch or leave 0. Session is saved on join and restored on wake so the device can skip join when possible. Sleep interval: 30 s in development (`USE_DEV_SLEEP 1`), 6 h in production (`USE_DEV_SLEEP 0`).
 
-In [TTN Console](https://console.thethingsnetwork.org/) (or [The Things Stack](https://console.thethings.network/)) → Application → Payload Formats → decoder, use a Cayenne LPP decoder or this custom decoder for ch0 (Unix timestamp), ch1 (battery V), and ch2 (temperature, 1-byte encoding):
+In [TTN Console](https://console.thethingsnetwork.org/) (or [The Things Stack](https://console.thethings.network/)) → Application → Payload Formats: **use Custom** (not the built-in Cayenne LPP). The built-in Cayenne LPP formatter does not support our custom type 128 (Unix timestamp) and will produce `as.up.data.decode.fail` with `pkg/messageprocessors/cayennelpp` / "invalid output". Paste this decoder for ch0 (Unix timestamp), ch1 (battery V), and ch2 (temperature, 1-byte encoding):
 
 ```javascript
 function decodeUplink(input) {
@@ -93,5 +93,7 @@ The decoded values appear in the application data.
 That's it, enjoy LoRaWAN with your feather!
 
 If the gateway receives 0 packets or joins fail, check: DIO1→D6 wiring, 8.2 cm antenna for 868 MHz, use of **huebe/arduino-lmic** (not another LMIC), Feather M0 as board, and EU868 / Europe 863–870 MHz in TTN. See project `docs/dev-notes/` (e.g. `20260127-debug-m0-ttn-gateway-zero-packets.md`) for a debug checklist.
+
+If you see **`as.up.data.decode.fail`** with `namespace: pkg/messageprocessors/cayennelpp` and `message_format: invalid output`, the application is using the built-in Cayenne LPP payload formatter, which does not support our custom type 128 (timestamp). Switch to **Custom** formatter and use the JavaScript decoder above.
 
 Enjoyed this article? Head over to [Werktag Blog](https://blog.werktag.io) for more articles.

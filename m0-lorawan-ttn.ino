@@ -31,7 +31,9 @@
  *
  * Battery/sleep/Cayenne LPP (c) 2026: STANDBY deep sleep between sends (Arduino Low Power);
  * payload = Cayenne LPP: ch0 Unix timestamp (seconds since Epoch, RTC), ch1 battery V, ch2 DS18B20 temp (1 byte).
- * RTC keeps time across sleep; epoch persisted in flash for restore after power loss. Set RTC_DEFAULT_EPOCH or time source for initial time.
+ * RTC keeps time across sleep; epoch persisted in flash for restore after power loss. RTC is synced from the network
+ * via LoRaWAN DeviceTimeReq/DeviceTimeAns (LMIC_requestNetworkTime); first request after EV_JOINED, then at most
+ * once per 24 h (TTN fair use). Requires LMIC with LoRaWAN 1.0.3 and LMIC_ENABLE_DeviceTimeReq (e.g. MCCI LMIC).
  * Session saved on join, restored on wake to skip join.
  *******************************************************************************/
 
@@ -52,10 +54,16 @@ DallasTemperature sensors(&oneWire);
 
 RTCZero rtc;
 
-/* Initial RTC epoch when no persisted value. Set to current Unix time at flash, or 0 to send 0 until time is set (e.g. via downlink). */
+/* Initial RTC epoch when no persisted value. Set to current Unix time at flash, or 0; network time sync will set RTC after join. */
 #ifndef RTC_DEFAULT_EPOCH
 #define RTC_DEFAULT_EPOCH 0
 #endif
+
+/* GPS epoch (1980-01-06 00:00:00 UTC) to Unix epoch (1970-01-01), minus leap seconds (~18). Used when LMIC returns DeviceTimeAns (GPS seconds). */
+#define GPS_TO_UNIX_EPOCH_OFFSET 315964782u
+
+/* Request network time at most this often (seconds). TTN fair use: once per 24 h is sufficient. */
+#define NETWORK_TIME_REQUEST_INTERVAL_SEC  (24 * 3600)
 
 // 1 = sleep 10 s (development), 0 = sleep 6 h (production)
 #define USE_DEV_SLEEP 1
@@ -94,7 +102,8 @@ typedef struct {
     uint8_t nwkKey[16];
     uint8_t artKey[16];
     uint32_t seqnoUp;  /* uplink frame counter; must increase for NS to accept after reset */
-    uint32_t rtcEpoch; /* last known Unix time (seconds since Epoch); restored on boot, updated after TX; at end for layout compatibility */
+    uint32_t rtcEpoch; /* last known Unix time (seconds since Epoch); restored on boot, updated after TX and after network-time sync */
+    uint32_t lastTimeSyncEpoch; /* last Unix time we got from DeviceTimeAns; used to throttle requests to once per 24 h; at end for layout */
 } PersistentData_t;
 
 PersistentData_t persistentData;
@@ -112,6 +121,29 @@ const lmic_pinmap lmic_pins = {
     .rst = LMIC_UNUSED_PIN,
     .dio = {3,6,LMIC_UNUSED_PIN},
 };
+
+/* Callback when DeviceTimeAns is received. LMIC gives GPS seconds; convert to Unix and set RTC. Throttle requests to once per 24 h. */
+static void userNetworkTimeCallback(void *pUserData, int flagSuccess) {
+    (void)pUserData;
+    if (flagSuccess != 1) {
+        Serial.println(F("Network time request failed"));
+        return;
+    }
+    lmic_time_reference_t lmicTimeRef;
+    if (!LMIC_getNetworkTimeReference(&lmicTimeRef)) {
+        Serial.println(F("Network time reference unavailable"));
+        return;
+    }
+    /* tNetwork is GPS seconds since 1980-01-06; convert to Unix epoch. */
+    uint32_t unixEpoch = (uint32_t)lmicTimeRef.tNetwork + GPS_TO_UNIX_EPOCH_OFFSET;
+    rtc.setEpoch((time_t)unixEpoch);
+    persistentData.rtcEpoch = unixEpoch;
+    persistentData.lastTimeSyncEpoch = unixEpoch;
+    persistentData.magic = PERSIST_MAGIC;
+    persistentStore.write(persistentData);
+    Serial.print(F("RTC synced to epoch: "));
+    Serial.println(unixEpoch);
+}
 
 // Suppress Serial during EV_JOINING..EV_JOINED/FAILED so runloop can service RX windows (~1–2 s after Join Request).
 void onEvent (ev_t ev) {
@@ -150,6 +182,7 @@ void onEvent (ev_t ev) {
             memcpy(persistentData.artKey, LMIC.artKey, 16);
             persistentData.seqnoUp = (uint32_t)LMIC.seqnoUp;
             persistentStore.write(persistentData);
+            LMIC_requestNetworkTime(userNetworkTimeCallback, NULL);
             break;
         case EV_RFU1:
             if (!quiet) Serial.println(F("EV_RFU1"));
@@ -257,6 +290,12 @@ void do_send(osjob_t* j) {
         Serial.println(F("OP_TXRXPEND, not sending"));
         return;
     }
+    /* Request network time at most once per 24 h (TTN fair use). First uplink after join already requested in EV_JOINED. */
+    uint32_t nowEpoch = (uint32_t)rtc.getEpoch();
+    uint32_t lastSync = persistentData.lastTimeSyncEpoch;
+    if (lastSync == 0 || lastSync == 0xFFFFFFFFu || nowEpoch >= lastSync + NETWORK_TIME_REQUEST_INTERVAL_SEC)
+        LMIC_requestNetworkTime(userNetworkTimeCallback, NULL);
+
     float vbat = analogRead(VBATPIN) * (2.0f * 3.3f / 1024.0f);
     sensors.requestTemperatures();
     float tempC = sensors.getTempCByIndex(0);
