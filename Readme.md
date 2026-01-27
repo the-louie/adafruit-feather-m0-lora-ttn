@@ -52,9 +52,9 @@ To adjust the TTN Credentials in the Sketch:
 
 ## Retrieving data on The Things Network
 
-The sketch sends **Cayenne LPP** ([Cayenne Low Power Payload](https://docs.mydevices.com/docs/lorawan/cayenne-lpp)): channel 0 = wake counter (Analog Input, 0.01 resolution), channel 1 = battery voltage in V (Analog Input, 0.01 resolution), channel 2 = DS18B20 temperature (Digital Input, 1 byte): 0 = error, 1 = &lt;0°C, 2 = &gt;30°C, 3–255 = temperature °C encoded as `(byte−3)/8.43` (~0.118°C/step over 0–30°C). Session is saved to flash on join and restored on wake so the device can skip join when possible. Sleep interval: 30 s in development (`USE_DEV_SLEEP 1`), 6 h in production (`USE_DEV_SLEEP 0`).
+The sketch sends **Cayenne LPP** ([Cayenne Low Power Payload](https://docs.mydevices.com/docs/lorawan/cayenne-lpp)): channel 0 = Unix timestamp (seconds since Epoch, custom type 128, 4 bytes MSB first), channel 1 = battery voltage in V (Analog Input, 0.01 resolution), channel 2 = DS18B20 temperature (Digital Input, 1 byte): 0 = error, 1 = &lt;0°C, 2 = &gt;30°C, 3–255 = temperature °C encoded as `(byte−3)/8.43` (~0.118°C/step over 0–30°C). Time is kept by the RTC (RTCZero) across sleep; epoch is persisted in flash and restored after power loss. Set `RTC_DEFAULT_EPOCH` in the sketch to current Unix time at flash time, or leave 0 until time is set (e.g. via downlink). Session is saved on join and restored on wake so the device can skip join when possible. Sleep interval: 30 s in development (`USE_DEV_SLEEP 1`), 6 h in production (`USE_DEV_SLEEP 0`).
 
-In [TTN Console](https://console.thethingsnetwork.org/) (or [The Things Stack](https://console.thethings.network/)) → Application → Payload Formats → decoder, use a Cayenne LPP decoder or this custom decoder for ch0 (counter), ch1 (battery V), and ch2 (temperature, 1-byte encoding):
+In [TTN Console](https://console.thethingsnetwork.org/) (or [The Things Stack](https://console.thethings.network/)) → Application → Payload Formats → decoder, use a Cayenne LPP decoder or this custom decoder for ch0 (Unix timestamp), ch1 (battery V), and ch2 (temperature, 1-byte encoding):
 
 ```javascript
 function decodeUplink(input) {
@@ -64,9 +64,11 @@ function decodeUplink(input) {
   var out = {};
   while (i < b.length) {
     var ch = b[i++], type = b[i++];
-    if (type === 2 && i + 2 <= b.length) {
+    if (type === 128 && i + 4 <= b.length) {
+      var ts = (b[i] << 24) | (b[i+1] << 16) | (b[i+2] << 8) | b[i+3]; i += 4;
+      if (ch === 0) out.timestamp_utc = ts;
+    } else if (type === 2 && i + 2 <= b.length) {
       var val = (b[i] << 8) | b[i+1]; i += 2;
-      if (ch === 0) out.wake_counter = val / 100;
       if (ch === 1) out.battery_v = val / 100;
     } else if (type === 0 && i < b.length) {
       var v = b[i++];
@@ -76,13 +78,13 @@ function decodeUplink(input) {
         else if (v === 2) out.temperature_state = 'over_range';
         else out.temperature_c = (v - 3) / 8.43;
       }
-    }
+    } else break;
   }
   return { data: out };
 }
 ```
 
-(Ch0/ch1: Cayenne LPP Analog Input type 2, 2-byte value MSB first, 0.01 resolution. Ch2: Digital Input type 0, 1 byte — 0=error, 1=&lt;0°C, 2=&gt;30°C, 3–255=(temp×8.43)+3 truncated.)
+(Ch0: custom type 128, 4 bytes MSB first = Unix timestamp (seconds since Epoch). Ch1: Cayenne LPP Analog Input type 2, 2-byte value MSB first, 0.01 resolution. Ch2: Digital Input type 0, 1 byte — 0=error, 1=&lt;0°C, 2=&gt;30°C, 3–255=(temp×8.43)+3 truncated.)
 
 The decoded values appear in the application data.
 

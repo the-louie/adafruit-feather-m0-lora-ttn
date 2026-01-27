@@ -30,15 +30,17 @@
  * Do not forget to define the radio type correctly in config.h.
  *
  * Battery/sleep/Cayenne LPP (c) 2026: STANDBY deep sleep between sends (Arduino Low Power);
- * payload = Cayenne LPP: ch0 wake counter, ch1 battery V, ch2 DS18B20 temp (1 byte: 0=err, 1=<0°C, 2=>30°C, 3–255=(T×8.43)+3).
+ * payload = Cayenne LPP: ch0 Unix timestamp (seconds since Epoch, RTC), ch1 battery V, ch2 DS18B20 temp (1 byte).
+ * RTC keeps time across sleep; epoch persisted in flash for restore after power loss. Set RTC_DEFAULT_EPOCH or time source for initial time.
  * Session saved on join, restored on wake to skip join.
  *******************************************************************************/
 
 #include <hal/hal.h>
 #include <SPI.h>
-// Install from Library Manager: "Arduino Low Power", "FlashStorage" by cmaglie, "Dallas Temperature" by Miles Burton
+// Install from Library Manager: "Arduino Low Power", "FlashStorage" by cmaglie, "Dallas Temperature" by Miles Burton, "RTCZero" by Arduino
 #include <ArduinoLowPower.h>
 #include <FlashStorage.h>
+#include <RTCZero.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
@@ -48,15 +50,23 @@
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
+RTCZero rtc;
+
+/* Initial RTC epoch when no persisted value. Set to current Unix time at flash, or 0 to send 0 until time is set (e.g. via downlink). */
+#ifndef RTC_DEFAULT_EPOCH
+#define RTC_DEFAULT_EPOCH 0
+#endif
+
 // 1 = sleep 10 s (development), 0 = sleep 6 h (production)
 #define USE_DEV_SLEEP 1
 #define SLEEP_SECONDS_DEV  10
 #define SLEEP_SECONDS_PROD (6 * 3600)
 #define SLEEP_SECONDS      (USE_DEV_SLEEP ? SLEEP_SECONDS_DEV : SLEEP_SECONDS_PROD)
 
-// Cayenne LPP: Digital Input = type 0 (1 byte); Analog Input = type 2 (2 bytes, 0.01, MSB first)
+// Cayenne LPP: Digital Input = type 0 (1 byte); Analog Input = type 2 (2 bytes, 0.01, MSB first); custom Unix time = type 128 (4 bytes, MSB first)
 #define LPP_DIGITAL_INPUT 0
 #define LPP_ANALOG_INPUT  2
+#define LPP_UNIX_TIME    128
 
 // Temperature (ch2): 1 byte. 0=error, 1=<0°C, 2=>30°C, 3–255=data (temp_c = (byte-3)/8.43, ~0.118°C/step)
 #define TEMP_ENCODED_SCALE 8.43f
@@ -84,6 +94,7 @@ typedef struct {
     uint8_t nwkKey[16];
     uint8_t artKey[16];
     uint32_t seqnoUp;  /* uplink frame counter; must increase for NS to accept after reset */
+    uint32_t rtcEpoch; /* last known Unix time (seconds since Epoch); restored on boot, updated after TX; at end for layout compatibility */
 } PersistentData_t;
 
 PersistentData_t persistentData;
@@ -160,10 +171,11 @@ void onEvent (ev_t ev) {
                 Serial.println(LMIC.dataLen);
                 Serial.println(F(" bytes of payload"));
             }
-            // Persist next wake index and uplink FCnt before delay/standby; NS rejects uplinks with FCnt not greater than last.
+            // Persist next wake index, uplink FCnt, and RTC epoch before delay/standby.
             persistentData.wakeCounter = wakeCounter + 1;
             persistentData.magic = PERSIST_MAGIC;
             persistentData.seqnoUp = (uint32_t)LMIC.seqnoUp;
+            persistentData.rtcEpoch = (uint32_t)rtc.getEpoch();
             persistentStore.write(persistentData);
             os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(2), do_sleep);
             break;
@@ -203,17 +215,18 @@ void onEvent (ev_t ev) {
     }
 }
 
-// Cayenne LPP: ch0 = wake counter, ch1 = battery V (Analog Input); ch2 = temperature (Digital Input, 1 byte).
+// Cayenne LPP: ch0 = Unix timestamp (type 128, 4 bytes MSB first), ch1 = battery V (Analog Input), ch2 = temperature (Digital Input, 1 byte).
 // Temperature encoding: 0=error, 1=<0°C, 2=>30°C, 3–255=(temp*8.43)+3 truncated, ~0.118°C/step.
-static uint8_t buildCayenneLPP(uint8_t* buf, uint32_t counter, float voltageV, float tempC) {
+static uint8_t buildCayenneLPP(uint8_t* buf, uint32_t epoch, float voltageV, float tempC) {
     uint8_t i = 0;
     int16_t val;
 
     buf[i++] = 0;
-    buf[i++] = LPP_ANALOG_INPUT;
-    val = (int16_t)((counter > 327u ? 327u : counter) * 100);
-    buf[i++] = (uint8_t)(val >> 8);
-    buf[i++] = (uint8_t)(val & 0xff);
+    buf[i++] = LPP_UNIX_TIME;
+    buf[i++] = (uint8_t)(epoch >> 24);
+    buf[i++] = (uint8_t)(epoch >> 16);
+    buf[i++] = (uint8_t)(epoch >> 8);
+    buf[i++] = (uint8_t)(epoch & 0xff);
 
     buf[i++] = 1;
     buf[i++] = LPP_ANALOG_INPUT;
@@ -247,16 +260,17 @@ void do_send(osjob_t* j) {
     float vbat = analogRead(VBATPIN) * (2.0f * 3.3f / 1024.0f);
     sensors.requestTemperatures();
     float tempC = sensors.getTempCByIndex(0);
+    uint32_t epoch = (uint32_t)rtc.getEpoch();
 
-    Serial.print(F("Sending wake="));
-    Serial.print(wakeCounter);
+    Serial.print(F("Sending ts="));
+    Serial.print(epoch);
     Serial.print(F(" VBat="));
     Serial.print(vbat);
     Serial.print(F(" Temp="));
     Serial.println(tempC);
 
     uint8_t lpp[16];
-    uint8_t len = buildCayenneLPP(lpp, wakeCounter, vbat, tempC);
+    uint8_t len = buildCayenneLPP(lpp, epoch, vbat, tempC);
     LMIC_setTxData2(1, lpp, len, 0);
     Serial.println(F("Packet queued (Cayenne LPP)"));
 }
@@ -298,6 +312,12 @@ void setup() {
     wakeCounter = haveStoredSession ? persistentData.wakeCounter : 0;
     Serial.print(F("Wake #"));
     Serial.println(wakeCounter);
+
+    rtc.begin();
+    if (haveStoredSession && persistentData.rtcEpoch != 0 && persistentData.rtcEpoch != 0xFFFFFFFFu)
+        rtc.setEpoch((time_t)persistentData.rtcEpoch);
+    else
+        rtc.setEpoch((time_t)RTC_DEFAULT_EPOCH);
 
     os_init();
     LMIC_reset();
