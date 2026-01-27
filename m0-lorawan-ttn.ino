@@ -29,41 +29,69 @@
  *
  * Do not forget to define the radio type correctly in config.h.
  *
+ * Battery/sleep/Cayenne LPP (c) 2026: STANDBY deep sleep between sends (Arduino Low Power);
+ * payload = Cayenne LPP: ch0 wake counter, ch1 battery V, ch2 DS18B20 temp (1 byte: 0=err, 1=<0°C, 2=>30°C, 3–255=(T×8.43)+3).
+ * Session saved on join, restored on wake to skip join.
  *******************************************************************************/
 
-#include <lmic.h>
 #include <hal/hal.h>
 #include <SPI.h>
-#include <avr/dtostrf.h>
-//#include <stdlib.h>
+// Install from Library Manager: "Arduino Low Power", "FlashStorage" by cmaglie, "Dallas Temperature" by Miles Burton
+#include <ArduinoLowPower.h>
+#include <FlashStorage.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 
 #define VBATPIN A7
+#define ONE_WIRE_BUS 5  /* DS18B20 data on pin 5 (not A5) */
 
-// This EUI must be in little-endian format, so least-significant-byte
-// first. When copying an EUI from ttnctl output, this means to reverse
-// the bytes. For TTN issued EUIs the last bytes should be 0xD5, 0xB3,
-// 0x70.
-static const u1_t PROGMEM APPEUI[8]={ 0xE2, 0xF5, 0x00, 0xD0, 0x7E, 0xD5, 0xB3, 0x70 };
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// 1 = sleep 10 s (development), 0 = sleep 6 h (production)
+#define USE_DEV_SLEEP 1
+#define SLEEP_SECONDS_DEV  10
+#define SLEEP_SECONDS_PROD (6 * 3600)
+#define SLEEP_SECONDS      (USE_DEV_SLEEP ? SLEEP_SECONDS_DEV : SLEEP_SECONDS_PROD)
+
+// Cayenne LPP: Digital Input = type 0 (1 byte); Analog Input = type 2 (2 bytes, 0.01, MSB first)
+#define LPP_DIGITAL_INPUT 0
+#define LPP_ANALOG_INPUT  2
+
+// Temperature (ch2): 1 byte. 0=error, 1=<0°C, 2=>30°C, 3–255=data (temp_c = (byte-3)/8.43, ~0.118°C/step)
+#define TEMP_ENCODED_SCALE 8.43f
+#define TEMP_ENCODED_OFFSET 3
+
+// AppEUI from docs/app-device-config.h (LORAWAN_APP_EUI). Little-endian.
+static const u1_t PROGMEM APPEUI[8] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 void os_getArtEui (u1_t* buf) { memcpy_P(buf, APPEUI, 8);}
 
-// This should also be in little endian format, see above.
-static const u1_t PROGMEM DEVEUI[8]={ 0xFE, 0xCE, 0xC7, 0x84, 0xAA, 0xBF, 0x84, 0x00 };
+// DevEUI from docs/app-device-config.h (LORAWAN_DEVICE_EUI "70B3D57ED007560E"). Little-endian.
+static const u1_t PROGMEM DEVEUI[8] = { 0x0E, 0x56, 0x07, 0xD0, 0x7E, 0xD5, 0xB3, 0x70 };
 void os_getDevEui (u1_t* buf) { memcpy_P(buf, DEVEUI, 8);}
 
-// This key should be in big endian format (or, since it is not really a
-// number but a block of memory, endianness does not really apply). In
-// practice, a key taken from ttnctl can be copied as-is.
-// The key shown here is the semtech default key.
-static const u1_t PROGMEM APPKEY[16] = { 0x9B, 0x50, 0x32, 0xBB, 0x42, 0xE4, 0x66, 0xF8, 0x7D, 0x5D, 0x40, 0x1C, 0x37, 0x2B, 0xDC, 0xAF };
-void os_getDevKey (u1_t* buf) {  memcpy_P(buf, APPKEY, 16);}
+// AppKey from docs/app-device-config.h (LORAWAN_APP_KEY). Copied as-is from TTN.
+static const u1_t PROGMEM APPKEY[16] = { 0x72, 0xA5, 0x30, 0xB5, 0xB0, 0xE7, 0xC3, 0x0C, 0x65, 0x2D, 0x66, 0xAD, 0x6D, 0xA9, 0x2C, 0xD5 };
+void os_getDevKey (u1_t* buf) { memcpy_P(buf, APPKEY, 16);}
 
+#define PERSIST_MAGIC 0x4C4D4943  // "LMIC"
 
-char mydata[16];
+typedef struct {
+    uint32_t magic;
+    uint32_t wakeCounter;
+    uint32_t netid;
+    uint32_t devaddr;
+    uint8_t nwkKey[16];
+    uint8_t artKey[16];
+    uint32_t seqnoUp;  /* uplink frame counter; must increase for NS to accept after reset */
+} PersistentData_t;
+
+PersistentData_t persistentData;
+FlashStorage(persistentStore, PersistentData_t);
+
 static osjob_t sendjob;
-
-// Schedule TX every this many seconds (might become longer due to duty
-// cycle limitations).
-const unsigned TX_INTERVAL = 300;
+static uint32_t wakeCounter;  // value sent this run
+static bool haveStoredSession;
 
 // Pin mapping
 
@@ -74,121 +102,218 @@ const lmic_pinmap lmic_pins = {
     .dio = {3,6,LMIC_UNUSED_PIN},
 };
 
+// Suppress Serial during EV_JOINING..EV_JOINED/FAILED so runloop can service RX windows (~1–2 s after Join Request).
 void onEvent (ev_t ev) {
-    Serial.print(os_getTime());
-    Serial.print(": ");
+    static bool joining = false;
+    bool quiet = joining && (ev != EV_JOINED && ev != EV_JOIN_FAILED);
+    if (!quiet) {
+        Serial.print(os_getTime());
+        Serial.print(": ");
+    }
     switch(ev) {
         case EV_SCAN_TIMEOUT:
-            Serial.println(F("EV_SCAN_TIMEOUT"));
+            if (!quiet) Serial.println(F("EV_SCAN_TIMEOUT"));
             break;
         case EV_BEACON_FOUND:
-            Serial.println(F("EV_BEACON_FOUND"));
+            if (!quiet) Serial.println(F("EV_BEACON_FOUND"));
             break;
         case EV_BEACON_MISSED:
-            Serial.println(F("EV_BEACON_MISSED"));
+            if (!quiet) Serial.println(F("EV_BEACON_MISSED"));
             break;
         case EV_BEACON_TRACKED:
-            Serial.println(F("EV_BEACON_TRACKED"));
+            if (!quiet) Serial.println(F("EV_BEACON_TRACKED"));
             break;
         case EV_JOINING:
-            Serial.println(F("EV_JOINING"));
+            joining = true;
+            if (!quiet) Serial.println(F("EV_JOINING"));
             break;
         case EV_JOINED:
+            joining = false;
             Serial.println(F("EV_JOINED"));
-
-            // Disable link check validation (automatically enabled
-            // during join, but not supported by TTN at this time).
             LMIC_setLinkCheckMode(0);
+            persistentData.magic = PERSIST_MAGIC;
+            persistentData.wakeCounter = wakeCounter;
+            persistentData.netid = (uint32_t)LMIC.netid;
+            persistentData.devaddr = (uint32_t)LMIC.devaddr;
+            memcpy(persistentData.nwkKey, LMIC.nwkKey, 16);
+            memcpy(persistentData.artKey, LMIC.artKey, 16);
+            persistentData.seqnoUp = (uint32_t)LMIC.seqnoUp;
+            persistentStore.write(persistentData);
             break;
         case EV_RFU1:
-            Serial.println(F("EV_RFU1"));
+            if (!quiet) Serial.println(F("EV_RFU1"));
             break;
         case EV_JOIN_FAILED:
+            joining = false;
             Serial.println(F("EV_JOIN_FAILED"));
+            // Retry join after 60 s (no Join Accept in RX window; avoid blocking runloop during join).
+            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(60), do_send);
             break;
         case EV_REJOIN_FAILED:
-            Serial.println(F("EV_REJOIN_FAILED"));
-            break;
+            if (!quiet) Serial.println(F("EV_REJOIN_FAILED"));
             break;
         case EV_TXCOMPLETE:
-            Serial.println(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
-            if (LMIC.txrxFlags & TXRX_ACK)
-              Serial.println(F("Received ack"));
-            if (LMIC.dataLen) {
-              Serial.println(F("Received "));
-              Serial.println(LMIC.dataLen);
-              Serial.println(F(" bytes of payload"));
+            if (!quiet) Serial.println(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
+            if (!quiet && (LMIC.txrxFlags & TXRX_ACK)) Serial.println(F("Received ack"));
+            if (!quiet && LMIC.dataLen) {
+                Serial.println(F("Received "));
+                Serial.println(LMIC.dataLen);
+                Serial.println(F(" bytes of payload"));
             }
-            // Schedule next transmission
-            os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(TX_INTERVAL), do_send);
+            // Persist next wake index and uplink FCnt before delay/standby; NS rejects uplinks with FCnt not greater than last.
+            persistentData.wakeCounter = wakeCounter + 1;
+            persistentData.magic = PERSIST_MAGIC;
+            persistentData.seqnoUp = (uint32_t)LMIC.seqnoUp;
+            persistentStore.write(persistentData);
+            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(2), do_sleep);
             break;
         case EV_LOST_TSYNC:
-            Serial.println(F("EV_LOST_TSYNC"));
+            if (!quiet) Serial.println(F("EV_LOST_TSYNC"));
             break;
         case EV_RESET:
-            Serial.println(F("EV_RESET"));
+            if (!quiet) Serial.println(F("EV_RESET"));
             break;
         case EV_RXCOMPLETE:
-            // data received in ping slot
-            Serial.println(F("EV_RXCOMPLETE"));
+            if (!quiet) Serial.println(F("EV_RXCOMPLETE"));
             break;
         case EV_LINK_DEAD:
-            Serial.println(F("EV_LINK_DEAD"));
+            if (!quiet) Serial.println(F("EV_LINK_DEAD"));
             break;
         case EV_LINK_ALIVE:
-            Serial.println(F("EV_LINK_ALIVE"));
+            if (!quiet) Serial.println(F("EV_LINK_ALIVE"));
             break;
-         default:
-            Serial.println(F("Unknown event"));
+        case 16:
+            if (!quiet) Serial.println(F("EV_SCAN_FOUND (MCCI/extended)"));
+            break;
+        case 17:
+            if (!quiet) Serial.println(F("EV_TXSTART (radio TX started)"));
+            break;
+        case 18:
+            if (!quiet) Serial.println(F("EV_TXCANCELED (MCCI/extended)"));
+            break;
+        case 19:
+            if (!quiet) Serial.println(F("EV_RXSTART (opening RX window)"));
+            break;
+        case 20:
+            if (!quiet) Serial.println(F("EV_JOIN_TXCOMPLETE (Join Request sent, waiting Join Accept)"));
+            break;
+        default:
+            if (!quiet) { Serial.print(F("Unknown event ")); Serial.println((int)ev); }
             break;
     }
 }
 
-void readValues(unsigned char *vals) {
-    // Payload format Bytes: [(Bat-Voltage - 2) * 100]
-    double measuredvbat = analogRead(VBATPIN);
-    measuredvbat *= 2;    // we divided by 2, so multiply back
-    measuredvbat *= 3.3;  // Multiply by 3.3V, our reference voltage
-    measuredvbat /= 1024; // convert to voltage
-    Serial.print("VBat: " ); Serial.println(measuredvbat);
-    measuredvbat -= 2; // offset by -2
-    measuredvbat *= 100; //make it centi volts
-    Serial.print("VBat in CVolts-2: " ); Serial.println(measuredvbat);
-    vals[0] = (unsigned char)measuredvbat; //we're unsigned
+// Cayenne LPP: ch0 = wake counter, ch1 = battery V (Analog Input); ch2 = temperature (Digital Input, 1 byte).
+// Temperature encoding: 0=error, 1=<0°C, 2=>30°C, 3–255=(temp*8.43)+3 truncated, ~0.118°C/step.
+static uint8_t buildCayenneLPP(uint8_t* buf, uint32_t counter, float voltageV, float tempC) {
+    uint8_t i = 0;
+    int16_t val;
+
+    buf[i++] = 0;
+    buf[i++] = LPP_ANALOG_INPUT;
+    val = (int16_t)((counter > 327u ? 327u : counter) * 100);
+    buf[i++] = (uint8_t)(val >> 8);
+    buf[i++] = (uint8_t)(val & 0xff);
+
+    buf[i++] = 1;
+    buf[i++] = LPP_ANALOG_INPUT;
+    val = (int16_t)(voltageV * 100.0f);
+    buf[i++] = (uint8_t)(val >> 8);
+    buf[i++] = (uint8_t)(val & 0xff);
+
+    buf[i++] = 2;
+    buf[i++] = LPP_DIGITAL_INPUT;
+    if (tempC < -50.0f || tempC != tempC) {
+        buf[i++] = 0;
+    } else if (tempC < 0.0f) {
+        buf[i++] = 1;
+    } else if (tempC > 30.0f) {
+        buf[i++] = 2;
+    } else {
+        int v = (int)(tempC * TEMP_ENCODED_SCALE + (float)TEMP_ENCODED_OFFSET);
+        if (v > 255) v = 255;
+        if (v < TEMP_ENCODED_OFFSET) v = TEMP_ENCODED_OFFSET;
+        buf[i++] = (uint8_t)v;
+    }
+
+    return i;
 }
 
-void do_send(osjob_t* j){
-    // Check if there is not a current TX/RX job running
+void do_send(osjob_t* j) {
     if (LMIC.opmode & OP_TXRXPEND) {
         Serial.println(F("OP_TXRXPEND, not sending"));
-    } else {
-        // Prepare upstream data transmission at the next possible time.
-        unsigned char payload;
-        readValues(&payload);
-        LMIC_setTxData2(1, &payload, 1, 0);
-        Serial.println(F("Packet queued"));
+        return;
     }
-    // Next TX is scheduled after TX_COMPLETE event.
+    float vbat = analogRead(VBATPIN) * (2.0f * 3.3f / 1024.0f);
+    sensors.requestTemperatures();
+    float tempC = sensors.getTempCByIndex(0);
+
+    Serial.print(F("Sending wake="));
+    Serial.print(wakeCounter);
+    Serial.print(F(" VBat="));
+    Serial.print(vbat);
+    Serial.print(F(" Temp="));
+    Serial.println(tempC);
+
+    uint8_t lpp[16];
+    uint8_t len = buildCayenneLPP(lpp, wakeCounter, vbat, tempC);
+    LMIC_setTxData2(1, lpp, len, 0);
+    Serial.println(F("Packet queued (Cayenne LPP)"));
+}
+
+// STANDBY sleep via Arduino Low Power (re-inits clocks, RTC wake). Optional: detach USB before
+// sleep for true ~5–15 µA; set DETACH_USB_BEFORE_SLEEP 1 and provide USBDevice if your core has it.
+#define DETACH_USB_BEFORE_SLEEP 0
+#if DETACH_USB_BEFORE_SLEEP
+#include <USB/USBDevice.h>
+#endif
+
+void do_sleep(osjob_t* j) {
+    (void)j;
+    /* Re-persist state already set in EV_TXCOMPLETE (wakeCounter+1, seqnoUp). Do not
+     * update wakeCounter here: use of persistentData.wakeCounter would double-increment
+     * and yield payload counters 0,2,4,6,8 instead of 0,1,2,3,4,... */
+    persistentData.magic = PERSIST_MAGIC;
+    persistentStore.write(persistentData);
+
+#if DETACH_USB_BEFORE_SLEEP
+    USBDevice.detach();
+#endif
+    LowPower.deepSleep((uint32_t)SLEEP_SECONDS * 1000UL);
+#if DETACH_USB_BEFORE_SLEEP
+    USBDevice.attach();
+#endif
+    wakeCounter = persistentData.wakeCounter;
+    do_send(&sendjob);
 }
 
 
 void setup() {
     Serial.begin(9600);
-    delay(10000);
+    delay(2000);
     Serial.println(F("Starting"));
 
-    // LMIC init
+    persistentStore.read(&persistentData);
+    haveStoredSession = (persistentData.magic == PERSIST_MAGIC);
+    wakeCounter = haveStoredSession ? persistentData.wakeCounter : 0;
+    Serial.print(F("Wake #"));
+    Serial.println(wakeCounter);
+
     os_init();
-    // Reset the MAC state. Session and pending data transfers will be discarded.
     LMIC_reset();
     LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);
 
-    // Start job (sending automatically starts OTAA too)
-    do_send(&sendjob);
+    if (haveStoredSession) {
+        LMIC_setSession(persistentData.netid, (u4_t)persistentData.devaddr,
+                        persistentData.nwkKey, persistentData.artKey);
+        LMIC.seqnoUp = (u4_t)persistentData.seqnoUp;
+        Serial.println(F("Session restored from flash"));
+    }
 
-    // Show on device LED that we are ready
     pinMode(13, OUTPUT);
     digitalWrite(13, HIGH);
+    sensors.begin();
+    do_send(&sendjob);
 }
 
 void loop() {

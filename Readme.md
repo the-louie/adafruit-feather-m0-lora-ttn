@@ -10,7 +10,11 @@ To work with The Things Network, a wire has to be soldered from DI01 to D6 (blue
 
 Adafruit [recommends](https://learn.adafruit.com/adafruit-feather-m0-radio-with-lora-radio-module/antenna-options) to solder an antenna with 8.2 cm length (for 868 MHz) to the antenna pin (yellow wire).
 
-## How to setup up a working development enviroment for the Feather M0 LoRa
+### DS18B20 temperature sensor (optional)
+
+To add a DS18B20 one-wire temperature sensor, use **Pin 5** for the data line. Alternatives: Pin 10, 11, or 12. Pins 3, 4, 6, 8, and 9 are in use by the LoRa radio or battery sense. Wiring: DS18B20 data → chosen pin; **4.7 kΩ** resistor from data to **3V**; GND → GND; VDD → **3V** (3.3 V operation). Install **Dallas Temperature** (Miles Burton) and **OneWire** (Paul Stoffregen) from Library Manager. See [DS18B20 pin and wiring](docs/ds18b20-pin-and-wiring.md) for details.
+
+## How to set up a working development environment for the Feather M0 LoRa
 
 Setup the Arduino IDE with the necessary libraries: Follow the [tutorial](https://learn.adafruit.com/adafruit-feather-m0-radio-with-lora-radio-module/overview) on Adafruit, or if your Arduino IDE (or VS Code with Arduino integration) is already setup, do:
 
@@ -26,6 +30,8 @@ Clone this Arduino Sketch: `git clone https://github.com/werktag/m0-lorawan-ttn`
 Clone the lmic library adjusted for the Feather M0 LoRa into your Arduino library folder: `git clone https://github.com/huebe/arduino-lmic` (The Arduino library folder is usually be found in `Documents\Arduino\libraries` in Windows, and `~/Arduino/libraries` in Linux)
 
 The changes to the original lmic library are a slower SPI speed and the correct radio settings.
+
+For the battery/sleep/Cayenne LPP version, install from **Library Manager** (Sketch → Include Library → Manage Libraries): search **"RTCZero"** → Install (by Arduino); search **"FlashStorage"** → Install (by cmaglie, for SAMD21 flash). Both are required; they are not bundled with the Adafruit SAMD board package.
 
 Now it's time to verify the sketch and upload it onto your feather.
 If the Sketch can't be uploaded, a double click on the reset button of the feather might help. The blinking red LED indicates that your feather is in bootloader state and ready to be programmed.
@@ -46,38 +52,44 @@ To adjust the TTN Credentials in the Sketch:
 
 ## Retrieving data on The Things Network
 
-As you might notice in the Sketch, the battery voltage gets squeezed into one byte:
+The sketch sends **Cayenne LPP** ([Cayenne Low Power Payload](https://docs.mydevices.com/docs/lorawan/cayenne-lpp)): channel 0 = wake counter (Analog Input, 0.01 resolution), channel 1 = battery voltage in V (Analog Input, 0.01 resolution), channel 2 = DS18B20 temperature (Digital Input, 1 byte): 0 = error, 1 = &lt;0°C, 2 = &gt;30°C, 3–255 = temperature °C encoded as `(byte−3)/8.43` (~0.118°C/step over 0–30°C). Session is saved to flash on join and restored on wake so the device can skip join when possible. Sleep interval: 30 s in development (`USE_DEV_SLEEP 1`), 6 h in production (`USE_DEV_SLEEP 0`).
 
-```c
-    // Payload format Bytes: [(Bat-Voltage - 2) * 100]
-    double measuredvbat = analogRead(VBATPIN);
-    measuredvbat *= 2;    // we divided by 2, so multiply back
-    measuredvbat *= 3.3;  // Multiply by 3.3V, our reference voltage
-    measuredvbat /= 1024; // convert to voltage
-    measuredvbat -= 2; // offset by -2
-    measuredvbat *= 100; //make it centi volts
-    vals[0] = (unsigned char)measuredvbat; //we're unsigned
-```
-
-As duty cycle is everything when transmitting data over LoRaWan, it's recommended to compress your data as much as possible. To make the data handling easier on the server, TTN provides a decoder functionality to decode the value into the better readable JSON format.
- In the [TTN Console](https://console.thethingsnetwork.org/) -> Application -> [your application] -> Payload Formats, add the following decoder function in the [decoder] tab:
+In [TTN Console](https://console.thethingsnetwork.org/) (or [The Things Stack](https://console.thethings.network/)) → Application → Payload Formats → decoder, use a Cayenne LPP decoder or this custom decoder for ch0 (counter), ch1 (battery V), and ch2 (temperature, 1-byte encoding):
 
 ```javascript
-function Decoder(b, port) {
-  
-  var bat = b[0] / 100 + 2;
-  
-  return {
-    battery: bat
+function decodeUplink(input) {
+  var b = input.bytes;
+  if (b.length < 4) return { data: {} };
+  var i = 0;
+  var out = {};
+  while (i < b.length) {
+    var ch = b[i++], type = b[i++];
+    if (type === 2 && i + 2 <= b.length) {
+      var val = (b[i] << 8) | b[i+1]; i += 2;
+      if (ch === 0) out.wake_counter = val / 100;
+      if (ch === 1) out.battery_v = val / 100;
+    } else if (type === 0 && i < b.length) {
+      var v = b[i++];
+      if (ch === 2) {
+        if (v === 0) out.temperature_state = 'error';
+        else if (v === 1) out.temperature_state = 'under_range';
+        else if (v === 2) out.temperature_state = 'over_range';
+        else out.temperature_c = (v - 3) / 8.43;
+      }
+    }
   }
+  return { data: out };
 }
 ```
 
-The decoded battery value should now appear in the Application Data Tab:
-![ttn data](ttn-console-data.png)
+(Ch0/ch1: Cayenne LPP Analog Input type 2, 2-byte value MSB first, 0.01 resolution. Ch2: Digital Input type 0, 1 byte — 0=error, 1=&lt;0°C, 2=&gt;30°C, 3–255=(temp×8.43)+3 truncated.)
+
+The decoded values appear in the application data.
 
 (as you might notice, the battery is charging ;) )
 
-That's it, enjoy LoRaWan with your feather!
+That's it, enjoy LoRaWAN with your feather!
+
+If the gateway receives 0 packets or joins fail, check: DIO1→D6 wiring, 8.2 cm antenna for 868 MHz, use of **huebe/arduino-lmic** (not another LMIC), Feather M0 as board, and EU868 / Europe 863–870 MHz in TTN. See project `docs/dev-notes/` (e.g. `20260127-debug-m0-ttn-gateway-zero-packets.md`) for a debug checklist.
 
 Enjoyed this article? Head over to [Werktag Blog](https://blog.werktag.io) for more articles.
