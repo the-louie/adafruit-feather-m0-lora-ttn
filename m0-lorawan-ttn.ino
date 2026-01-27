@@ -29,12 +29,11 @@
  *
  * Do not forget to define the radio type correctly in config.h.
  *
- * Battery/sleep/Cayenne LPP (c) 2026: STANDBY deep sleep between sends (Arduino Low Power);
- * payload = Cayenne LPP: ch0 Unix timestamp (seconds since Epoch, RTC), ch1 battery V, ch2 DS18B20 temp (1 byte).
- * RTC keeps time across sleep; epoch persisted in flash for restore after power loss. RTC is synced from the network
- * via LoRaWAN DeviceTimeReq/DeviceTimeAns (LMIC_requestNetworkTime); first request after EV_JOINED, then at most
- * once per 24 h (TTN fair use). Requires LMIC with LoRaWAN 1.0.3 and LMIC_ENABLE_DeviceTimeReq (e.g. MCCI LMIC).
- * Session saved on join, restored on wake to skip join.
+ * Batched log (c) 2026: measure every 30 min, append LogEntry (timeTick + temperature) to RAM; every 6 h backup
+ * RAM to Flash, attempt uplink; on success clear Flash, on failure keep Flash and retry in 6 h with next batch merged.
+ * Payload: [vbat×100][n][timeTick,temperature × n] big-endian; temperature = centidegrees 0–3000 or sentinels.
+ * RTC keeps time across sleep; epoch persisted in flash. RTC synced via DeviceTimeReq (first after EV_JOINED, ≤1/24 h).
+ * Session saved on join, restored on wake.
  *******************************************************************************/
 
 #include <hal/hal.h>
@@ -45,6 +44,7 @@
 #include <RTCZero.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <string.h>
 
 #define VBATPIN A7
 #define ONE_WIRE_BUS 5  /* DS18B20 data on pin 5 (not A5) */
@@ -65,20 +65,50 @@ RTCZero rtc;
 /* Request network time at most this often (seconds). TTN fair use: once per 24 h is sufficient. */
 #define NETWORK_TIME_REQUEST_INTERVAL_SEC  (24 * 3600)
 
-// 1 = sleep 10 s (development), 0 = sleep 6 h (production)
-#define USE_DEV_SLEEP 1
-#define SLEEP_SECONDS_DEV  10
-#define SLEEP_SECONDS_PROD (6 * 3600)
-#define SLEEP_SECONDS      (USE_DEV_SLEEP ? SLEEP_SECONDS_DEV : SLEEP_SECONDS_PROD)
+/* Measure every 30 min; every 12th wake (6 h) do backup+send. */
+#define MEASURE_INTERVAL_SEC  1800u   /* 30 min */
+#define SEND_PERIOD_MEASURES  12u     /* backup+send every 12 × 30 min = 6 h */
 
-// Cayenne LPP: Digital Input = type 0 (1 byte); Analog Input = type 2 (2 bytes, 0.01, MSB first); custom Unix time = type 128 (4 bytes, MSB first)
+// 1 = sleep 30 s (development), 0 = sleep 30 min (production)
+#define USE_DEV_SLEEP 1
+#define SLEEP_SECONDS_DEV  30
+#define SLEEP_SECONDS_PROD MEASURE_INTERVAL_SEC
+#define SLEEP_SECONDS      (USE_DEV_SLEEP ? SLEEP_SECONDS_DEV : (int)SLEEP_SECONDS_PROD)
+
+// Cayenne LPP: Digital Input = type 0 (1 byte); Analog Input = type 2 (2 bytes, 0.01, MSB first); custom type 128 = 30-min ticks since 2026-01-01 (3 bytes, big-endian)
 #define LPP_DIGITAL_INPUT 0
 #define LPP_ANALOG_INPUT  2
-#define LPP_UNIX_TIME    128
+#define LPP_TICK_TIME    128
+
+/* 30-minute tick encoding: epoch 2026-01-01 00:00:00 UTC, 1 tick = 30 min, 3 bytes (24 bits). */
+#define CUSTOM_EPOCH      1735689600u  /* Unix for 2026-01-01 00:00:00 UTC */
+#define SECONDS_PER_TICK  1800u        /* 30 minutes */
 
 // Temperature (ch2): 1 byte. 0=error, 1=<0°C, 2=>30°C, 3–255=data (temp_c = (byte-3)/8.43, ~0.118°C/step)
 #define TEMP_ENCODED_SCALE 8.43f
 #define TEMP_ENCODED_OFFSET 3
+
+/** One log entry: 30-min tick and 2-byte high-res temperature. Ensures packed 4-byte layout. */
+struct LogEntry {
+    uint16_t timeTick;    /* 30-min tick since 2026-01-01 00:00:00 UTC */
+    uint16_t temperature; /* Centidegrees 0–3000 (0.00–30.00°C); 0xFFFD=>30, 0xFFFE=<0, 0xFFFF=error */
+};
+#define LOG_ENTRIES_MAX 48  /* 48 × 30 min = 24 h in RAM */
+#define LOG_SEND_CAP     48  /* max entries in one uplink (payload cap) */
+
+static LogEntry dataBuffer[LOG_ENTRIES_MAX];
+static uint8_t ramCount;  /* number of valid entries in dataBuffer */
+
+#define LOG_FLASH_MAGIC 0x4C4F4731  /* "LOG1" */
+typedef struct {
+    uint32_t magic;
+    uint8_t count;
+    uint8_t reserved[3];
+    LogEntry entries[LOG_ENTRIES_MAX];
+} PersistentLog_t;
+
+static PersistentLog_t persistentLog;
+FlashStorage(logStore, PersistentLog_t);
 
 // AppEUI from docs/app-device-config.h (LORAWAN_APP_EUI). Little-endian.
 static const u1_t PROGMEM APPEUI[8] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
@@ -103,15 +133,17 @@ typedef struct {
     uint8_t artKey[16];
     uint32_t seqnoUp;  /* uplink frame counter; must increase for NS to accept after reset */
     uint32_t rtcEpoch; /* last known Unix time (seconds since Epoch); restored on boot, updated after TX and after network-time sync */
-    uint32_t lastTimeSyncEpoch; /* last Unix time we got from DeviceTimeAns; used to throttle requests to once per 24 h; at end for layout */
+    uint32_t lastTimeSyncEpoch; /* last Unix time we got from DeviceTimeAns; used to throttle requests to once per 24 h */
+    uint8_t measuresInPeriod;   /* 0..11: 30-min wakes since last send attempt; 12th wake triggers backup+send */
 } PersistentData_t;
 
 PersistentData_t persistentData;
 FlashStorage(persistentStore, PersistentData_t);
 
 static osjob_t sendjob;
-static uint32_t wakeCounter;  // value sent this run
 static bool haveStoredSession;
+
+void do_wake(osjob_t* j);  /* measure, append, then backup+send or sleep */
 
 // Pin mapping
 
@@ -175,7 +207,6 @@ void onEvent (ev_t ev) {
             Serial.println(F("EV_JOINED"));
             LMIC_setLinkCheckMode(0);
             persistentData.magic = PERSIST_MAGIC;
-            persistentData.wakeCounter = wakeCounter;
             persistentData.netid = (uint32_t)LMIC.netid;
             persistentData.devaddr = (uint32_t)LMIC.devaddr;
             memcpy(persistentData.nwkKey, LMIC.nwkKey, 16);
@@ -204,8 +235,10 @@ void onEvent (ev_t ev) {
                 Serial.println(LMIC.dataLen);
                 Serial.println(F(" bytes of payload"));
             }
-            // Persist next wake index, uplink FCnt, and RTC epoch before delay/standby.
-            persistentData.wakeCounter = wakeCounter + 1;
+            /* Send success: clear Flash log so next backup starts fresh. */
+            persistentLog.magic = 0;
+            persistentLog.count = 0;
+            logStore.write(persistentLog);
             persistentData.magic = PERSIST_MAGIC;
             persistentData.seqnoUp = (uint32_t)LMIC.seqnoUp;
             persistentData.rtcEpoch = (uint32_t)rtc.getEpoch();
@@ -248,40 +281,29 @@ void onEvent (ev_t ev) {
     }
 }
 
-// Cayenne LPP: ch0 = Unix timestamp (type 128, 4 bytes MSB first), ch1 = battery V (Analog Input), ch2 = temperature (Digital Input, 1 byte).
-// Temperature encoding: 0=error, 1=<0°C, 2=>30°C, 3–255=(temp*8.43)+3 truncated, ~0.118°C/step.
-static uint8_t buildCayenneLPP(uint8_t* buf, uint32_t epoch, float voltageV, float tempC) {
-    uint8_t i = 0;
-    int16_t val;
+/** Encode temperature °C as 2-byte value: 0–3000 = centidegrees (0.00–30.00°C), 0xFFFD=>30, 0xFFFE=<0, 0xFFFF=error. */
+static uint16_t encodeTemperatureHighRes(float tempC) {
+    if (tempC < -50.0f || tempC != tempC) return 0xFFFFu;
+    if (tempC < 0.0f) return 0xFFFEu;
+    if (tempC > 30.0f) return 0xFFFDu;
+    int v = (int)(tempC * 100.0f);
+    if (v > 3000) v = 3000;
+    if (v < 0) v = 0;
+    return (uint16_t)v;
+}
 
-    buf[i++] = 0;
-    buf[i++] = LPP_UNIX_TIME;
-    buf[i++] = (uint8_t)(epoch >> 24);
-    buf[i++] = (uint8_t)(epoch >> 16);
-    buf[i++] = (uint8_t)(epoch >> 8);
-    buf[i++] = (uint8_t)(epoch & 0xff);
-
-    buf[i++] = 1;
-    buf[i++] = LPP_ANALOG_INPUT;
-    val = (int16_t)(voltageV * 100.0f);
-    buf[i++] = (uint8_t)(val >> 8);
-    buf[i++] = (uint8_t)(val & 0xff);
-
-    buf[i++] = 2;
-    buf[i++] = LPP_DIGITAL_INPUT;
-    if (tempC < -50.0f || tempC != tempC) {
-        buf[i++] = 0;
-    } else if (tempC < 0.0f) {
-        buf[i++] = 1;
-    } else if (tempC > 30.0f) {
-        buf[i++] = 2;
-    } else {
-        int v = (int)(tempC * TEMP_ENCODED_SCALE + (float)TEMP_ENCODED_OFFSET);
-        if (v > 255) v = 255;
-        if (v < TEMP_ENCODED_OFFSET) v = TEMP_ENCODED_OFFSET;
-        buf[i++] = (uint8_t)v;
+/** Build batched payload: [vbat_hi,vbat_lo][n][timeTick_hi,timeTick_lo,temp_hi,temp_lo] × n, big-endian. Max 2+1+4*48 bytes. */
+static uint16_t buildBatchPayload(uint8_t* buf, uint16_t vbatCentivolt, uint8_t n, const LogEntry* entries) {
+    uint16_t i = 0;
+    buf[i++] = (uint8_t)(vbatCentivolt >> 8);
+    buf[i++] = (uint8_t)(vbatCentivolt & 0xFF);
+    buf[i++] = n;
+    for (uint8_t k = 0; k < n && (i + 4) <= 256u; k++) {
+        buf[i++] = (uint8_t)(entries[k].timeTick >> 8);
+        buf[i++] = (uint8_t)(entries[k].timeTick & 0xFF);
+        buf[i++] = (uint8_t)(entries[k].temperature >> 8);
+        buf[i++] = (uint8_t)(entries[k].temperature & 0xFF);
     }
-
     return i;
 }
 
@@ -296,22 +318,80 @@ void do_send(osjob_t* j) {
     if (lastSync == 0 || lastSync == 0xFFFFFFFFu || nowEpoch >= lastSync + NETWORK_TIME_REQUEST_INTERVAL_SEC)
         LMIC_requestNetworkTime(userNetworkTimeCallback, NULL);
 
-    float vbat = analogRead(VBATPIN) * (2.0f * 3.3f / 1024.0f);
+    uint16_t vbatCentivolt = (uint16_t)(analogRead(VBATPIN) * (2.0f * 3.3f / 1024.0f) * 100.0f);
+    uint8_t n = (persistentLog.count <= LOG_SEND_CAP) ? persistentLog.count : (uint8_t)LOG_SEND_CAP;
+    uint8_t paybuf[2 + 1 + 4 * LOG_SEND_CAP];
+    uint16_t payLen = buildBatchPayload(paybuf, vbatCentivolt, n, persistentLog.entries);
+
+    Serial.print(F("Sending batch n="));
+    Serial.print(n);
+    Serial.print(F(" VBat="));
+    Serial.println((float)vbatCentivolt / 100.0f);
+
+    LMIC_setTxData2(1, paybuf, (uint8_t)payLen, 0);
+    Serial.println(F("Packet queued (batch)"));
+}
+
+/** Merge Flash log with RAM buffer, cap at LOG_ENTRIES_MAX, save to Flash, clear RAM. */
+static void mergeBackupAndPrepareSend(void) {
+    logStore.read(&persistentLog);
+    uint8_t flashCount = (persistentLog.magic == LOG_FLASH_MAGIC && persistentLog.count <= LOG_ENTRIES_MAX)
+        ? persistentLog.count : 0;
+    uint8_t total = flashCount + ramCount;
+    if (total > LOG_ENTRIES_MAX) total = LOG_ENTRIES_MAX;
+    /* Build merged list: flash entries first, then RAM entries, in a temp buffer. */
+    LogEntry merged[LOG_ENTRIES_MAX];
+    uint8_t i = 0;
+    for (uint8_t k = 0; k < flashCount && i < total; k++) merged[i++] = persistentLog.entries[k];
+    for (uint8_t k = 0; k < ramCount && i < total; k++) merged[i++] = dataBuffer[k];
+    persistentLog.magic = LOG_FLASH_MAGIC;
+    persistentLog.count = i;
+    for (uint8_t k = 0; k < i; k++) persistentLog.entries[k] = merged[k];
+    logStore.write(persistentLog);
+    ramCount = 0;
+}
+
+/** Called after each wake (from setup or after do_sleep). Measure, append to RAM, then either sleep or backup+send. */
+void do_wake(osjob_t* j) {
+    (void)j;
     sensors.requestTemperatures();
     float tempC = sensors.getTempCByIndex(0);
     uint32_t epoch = (uint32_t)rtc.getEpoch();
+    uint32_t t = (epoch < CUSTOM_EPOCH) ? CUSTOM_EPOCH : epoch;
+    uint32_t ticks = (t - CUSTOM_EPOCH) / SECONDS_PER_TICK;
+    if (ticks > 0xFFFFu) ticks = 0xFFFFu;
+    LogEntry e;
+    e.timeTick = (uint16_t)ticks;
+    e.temperature = encodeTemperatureHighRes(tempC);
 
-    Serial.print(F("Sending ts="));
+    if (ramCount < LOG_ENTRIES_MAX) {
+        dataBuffer[ramCount++] = e;
+    } else {
+        memmove(dataBuffer, &dataBuffer[1], (LOG_ENTRIES_MAX - 1) * sizeof(LogEntry));
+        dataBuffer[LOG_ENTRIES_MAX - 1] = e;
+    }
+
+    uint8_t period = persistentData.measuresInPeriod % 12;
+    period = (period + 1) % 12;
+    persistentData.measuresInPeriod = period;
+    persistentData.wakeCounter++;
+    persistentData.magic = PERSIST_MAGIC;
+    persistentStore.write(persistentData);
+
+    Serial.print(F("Wake #"));
+    Serial.print(persistentData.wakeCounter);
+    Serial.print(F(" ts="));
     Serial.print(epoch);
-    Serial.print(F(" VBat="));
-    Serial.print(vbat);
     Serial.print(F(" Temp="));
     Serial.println(tempC);
 
-    uint8_t lpp[16];
-    uint8_t len = buildCayenneLPP(lpp, epoch, vbat, tempC);
-    LMIC_setTxData2(1, lpp, len, 0);
-    Serial.println(F("Packet queued (Cayenne LPP)"));
+    if (period == 0) {
+        /* 12th wake: backup RAM to Flash (merge with any existing), then send. */
+        mergeBackupAndPrepareSend();
+        do_send(&sendjob);
+    } else {
+        do_sleep(&sendjob);
+    }
 }
 
 // STANDBY sleep via Arduino Low Power (re-inits clocks, RTC wake). Optional: detach USB before
@@ -323,9 +403,6 @@ void do_send(osjob_t* j) {
 
 void do_sleep(osjob_t* j) {
     (void)j;
-    /* Re-persist state already set in EV_TXCOMPLETE (wakeCounter+1, seqnoUp). Do not
-     * update wakeCounter here: use of persistentData.wakeCounter would double-increment
-     * and yield payload counters 0,2,4,6,8 instead of 0,1,2,3,4,... */
     persistentData.magic = PERSIST_MAGIC;
     persistentStore.write(persistentData);
 
@@ -336,8 +413,7 @@ void do_sleep(osjob_t* j) {
 #if DETACH_USB_BEFORE_SLEEP
     USBDevice.attach();
 #endif
-    wakeCounter = persistentData.wakeCounter;
-    do_send(&sendjob);
+    do_wake(&sendjob);
 }
 
 
@@ -348,9 +424,15 @@ void setup() {
 
     persistentStore.read(&persistentData);
     haveStoredSession = (persistentData.magic == PERSIST_MAGIC);
-    wakeCounter = haveStoredSession ? persistentData.wakeCounter : 0;
+    if (!haveStoredSession) {
+        persistentData.wakeCounter = 0;
+        persistentData.measuresInPeriod = 0;
+    } else {
+        persistentData.measuresInPeriod = persistentData.measuresInPeriod % 12;
+    }
+    logStore.read(&persistentLog);
     Serial.print(F("Wake #"));
-    Serial.println(wakeCounter);
+    Serial.println(persistentData.wakeCounter);
 
     rtc.begin();
     if (haveStoredSession && persistentData.rtcEpoch != 0 && persistentData.rtcEpoch != 0xFFFFFFFFu)
@@ -372,7 +454,8 @@ void setup() {
     pinMode(13, OUTPUT);
     digitalWrite(13, HIGH);
     sensors.begin();
-    do_send(&sendjob);
+    ramCount = 0;
+    do_wake(&sendjob);
 }
 
 void loop() {

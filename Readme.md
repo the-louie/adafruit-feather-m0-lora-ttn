@@ -1,6 +1,6 @@
 # Adafruit Feather M0 LoRa on The Things Network
 
-This tutorial describes how to setup the [Adafruit Feather M0 with RFM95 LoRa Radio](https://www.adafruit.com/product/3178) for [The Things Network](https://www.thethingsnetwork.org/) and transmit the battery voltage encoded to reduce the duty cycle.
+This tutorial describes how to setup the [Adafruit Feather M0 with RFM95 LoRa Radio](https://www.adafruit.com/product/3178) for [The Things Network](https://www.thethingsnetwork.org/) and transmit batched temperature logs and battery voltage.
 
 ## Wiring
 
@@ -47,46 +47,64 @@ To adjust the TTN Credentials in the Sketch:
    * In the Device Overview, copy the Application EUI to the APPEUI variable in the Sketch in the C-Style lsb format.
    * In the Device Overview, copy the Device EUI to the DEVEUI variable in the Sketch in the C-Style lsb format.
    * In the Device Overview, copy the App Key to the APPKEY variable in the Sketch in the C-Style msb format.
-  
+
   ![ttn console](ttn-console-format.png)
 
 ## Retrieving data on The Things Network
 
-The sketch sends **Cayenne LPP** ([Cayenne Low Power Payload](https://docs.mydevices.com/docs/lorawan/cayenne-lpp)): channel 0 = Unix timestamp (seconds since Epoch, custom type 128, 4 bytes MSB first), channel 1 = battery voltage in V (Analog Input, 0.01 resolution), channel 2 = DS18B20 temperature (Digital Input, 1 byte): 0 = error, 1 = &lt;0°C, 2 = &gt;30°C, 3–255 = temperature °C encoded as `(byte−3)/8.43` (~0.118°C/step over 0–30°C). Time is kept by the RTC (RTCZero) across sleep; epoch is persisted in flash and restored after power loss. **RTC is synced from the network** via LoRaWAN DeviceTimeReq/DeviceTimeAns: the first request is sent after EV_JOINED, then at most once per 24 hours (TTN fair use). This requires an LMIC library that supports LoRaWAN 1.0.3 and DeviceTimeReq (e.g. [MCCI LoRaWAN LMIC](https://github.com/mcci-catena/arduino-lmic)); ensure `LMIC_ENABLE_DeviceTimeReq` is enabled in the LMIC project config. If no network time is available, set `RTC_DEFAULT_EPOCH` in the sketch or leave 0. Session is saved on join and restored on wake so the device can skip join when possible. Sleep interval: 30 s in development (`USE_DEV_SLEEP 1`), 6 h in production (`USE_DEV_SLEEP 0`).
+The sketch uses a **batched log flow**:
 
-In [TTN Console](https://console.thethingsnetwork.org/) (or [The Things Stack](https://console.thethings.network/)) → Application → Payload Formats: **use Custom** (not the built-in Cayenne LPP). The built-in Cayenne LPP formatter does not support our custom type 128 (Unix timestamp) and will produce `as.up.data.decode.fail` with `pkg/messageprocessors/cayennelpp` / "invalid output". Paste this decoder for ch0 (Unix timestamp), ch1 (battery V), and ch2 (temperature, 1-byte encoding):
+- **Measure:** Every 30 min it wakes, reads DS18B20 temperature and RTC, and appends one 4-byte **LogEntry** (2-byte 30-min tick since 2026-01-01 00:00:00 UTC, 2-byte high-res temperature in centidegrees) into a **RAM buffer** (up to 48 entries = 24 h).
+- **Backup:** Every 6 h (every 12th wake), before sending, it merges the current RAM buffer with any unsent data already in **Flash** and saves the combined log back to Flash.
+- **Send:** It builds one uplink with battery voltage plus the batched entries and attempts the LoRaWAN uplink.
+- **Confirm:** On success it clears the Flash log; on failure it keeps the data in Flash and retries in 6 h with the next batch merged in.
+
+Time is kept by the RTC (RTCZero) across sleep; epoch is persisted in flash and restored after power loss. **RTC is synced from the network** via LoRaWAN DeviceTimeReq/DeviceTimeAns (first after EV_JOINED, then at most once per 24 h). Session is saved on join and restored on wake. Sleep: 30 s in development (`USE_DEV_SLEEP 1`), 30 min in production (`USE_DEV_SLEEP 0`).
+
+**Payload format** (big-endian): `[vbat_hi, vbat_lo]` (battery × 100, 0.01 V), `[n]` (entry count, 0–48), then for each entry `[timeTick_hi, timeTick_lo, temp_hi, temp_lo]`. Temperature: 0–3000 = 0.00–30.00°C (centidegrees); 0xFFFD = &gt;30°C, 0xFFFE = &lt;0°C, 0xFFFF = error. Typical size about 60+ bytes (e.g. 2+1+4×12 = 51 bytes for 12 entries).
+
+In [TTN Console](https://console.thethingsnetwork.org/) (or [The Things Stack](https://console.thethings.network/)) → Application → Payload Formats: set to **Custom** and paste the decoder from [`ttn-decoder-batch.js`](ttn-decoder-batch.js), or use this:
 
 ```javascript
 function decodeUplink(input) {
   var b = input.bytes;
-  if (b.length < 4) return { data: {} };
-  var i = 0;
-  var out = {};
-  while (i < b.length) {
-    var ch = b[i++], type = b[i++];
-    if (type === 128 && i + 4 <= b.length) {
-      var ts = (b[i] << 24) | (b[i+1] << 16) | (b[i+2] << 8) | b[i+3]; i += 4;
-      if (ch === 0) out.timestamp_utc = ts;
-    } else if (type === 2 && i + 2 <= b.length) {
-      var val = (b[i] << 8) | b[i+1]; i += 2;
-      if (ch === 1) out.battery_v = val / 100;
-    } else if (type === 0 && i < b.length) {
-      var v = b[i++];
-      if (ch === 2) {
-        if (v === 0) out.temperature_state = 'error';
-        else if (v === 1) out.temperature_state = 'under_range';
-        else if (v === 2) out.temperature_state = 'over_range';
-        else out.temperature_c = (v - 3) / 8.43;
-      }
-    } else break;
+  if (!b || b.length < 3) {
+    if (input.frm_payload && typeof atob === 'function') {
+      var raw = atob(input.frm_payload);
+      b = [];
+      for (var i = 0; i < raw.length; i++) b.push(raw.charCodeAt(i));
+    }
   }
-  return { data: out };
+  if (!b || b.length < 3) return { data: {} };
+  if (typeof b.slice === 'function') b = Array.from(b);
+
+  var battery_v = ((b[0] << 8) | b[1]) / 100;
+  var n = b[2] & 0xFF;
+  var maxN = (b.length - 3) >> 2;
+  if (n > maxN) n = maxN;
+
+  var entries = [];
+  var customEpoch = new Date('2026-01-01T00:00:00Z').getTime();
+  for (var i = 0, j = 3; i < n && j + 4 <= b.length; i++, j += 4) {
+    var ticks = (b[j] << 8) | b[j + 1];
+    var temp = (b[j + 2] << 8) | b[j + 3];
+    var ts = new Date(customEpoch + ticks * 1800 * 1000).toISOString();
+    if (temp === 0xFFFF) {
+      entries.push({ timestamp: ts, temperature_state: 'error' });
+    } else if (temp === 0xFFFE) {
+      entries.push({ timestamp: ts, temperature_state: 'under_range' });
+    } else if (temp === 0xFFFD) {
+      entries.push({ timestamp: ts, temperature_state: 'over_range' });
+    } else {
+      entries.push({ timestamp: ts, temperature_c: temp / 100 });
+    }
+  }
+
+  return { data: { battery_v: battery_v, entries: entries } };
 }
 ```
 
-(Ch0: custom type 128, 4 bytes MSB first = Unix timestamp (seconds since Epoch). Ch1: Cayenne LPP Analog Input type 2, 2-byte value MSB first, 0.01 resolution. Ch2: Digital Input type 0, 1 byte — 0=error, 1=&lt;0°C, 2=&gt;30°C, 3–255=(temp×8.43)+3 truncated.)
-
-The decoded values appear in the application data.
+The decoded `battery_v` and `entries[]` (each with `timestamp` and `temperature_c` or `temperature_state`) appear in the application data.
 
 (as you might notice, the battery is charging ;) )
 
@@ -94,6 +112,6 @@ That's it, enjoy LoRaWAN with your feather!
 
 If the gateway receives 0 packets or joins fail, check: DIO1→D6 wiring, 8.2 cm antenna for 868 MHz, use of **huebe/arduino-lmic** (not another LMIC), Feather M0 as board, and EU868 / Europe 863–870 MHz in TTN. See project `docs/dev-notes/` (e.g. `20260127-debug-m0-ttn-gateway-zero-packets.md`) for a debug checklist.
 
-If you see **`as.up.data.decode.fail`** with `namespace: pkg/messageprocessors/cayennelpp` and `message_format: invalid output`, the application is using the built-in Cayenne LPP payload formatter, which does not support our custom type 128 (timestamp). Switch to **Custom** formatter and use the JavaScript decoder above.
+If you see **`as.up.data.decode.fail`**, ensure the application uses **Custom** payload formatter with the batched decoder above (not built-in Cayenne LPP).
 
 Enjoyed this article? Head over to [Werktag Blog](https://blog.werktag.io) for more articles.
