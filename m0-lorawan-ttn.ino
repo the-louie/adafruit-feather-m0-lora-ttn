@@ -65,15 +65,36 @@ RTCZero rtc;
 /* Request network time at most this often (seconds). TTN fair use: once per 24 h is sufficient. */
 #define NETWORK_TIME_REQUEST_INTERVAL_SEC  (24 * 3600)
 
-/* Measure every 5 min; every 72nd wake (6 h) do backup+send. */
-#define MEASURE_INTERVAL_SEC  300u    /* 5 min */
-#define SEND_PERIOD_MEASURES  72u     /* backup+send every 72 × 5 min = 6 h */
+/* RUN_MODE: DEV = short intervals + Serial; TEST = medium intervals + Serial; PROD = 5 min / 6 h, no Serial. */
+#define RUN_MODE_DEV  1
+#define RUN_MODE_TEST 2
+#define RUN_MODE_PROD 3
+#define RUN_MODE RUN_MODE_DEV
 
-// 1 = sleep 30 s (development), 0 = sleep 5 min (production)
-#define USE_DEV_SLEEP 1
-#define SLEEP_SECONDS_DEV  30
-#define SLEEP_SECONDS_PROD MEASURE_INTERVAL_SEC
-#define SLEEP_SECONDS      (USE_DEV_SLEEP ? SLEEP_SECONDS_DEV : (int)SLEEP_SECONDS_PROD)
+#if RUN_MODE == RUN_MODE_DEV
+#define MEASURE_INTERVAL_SEC  30u     /* 30 s */
+#define SEND_PERIOD_MEASURES  12u     /* backup+send every 12 × 30 s = 6 min */
+#define SLEEP_SECONDS        30
+#elif RUN_MODE == RUN_MODE_TEST
+#define MEASURE_INTERVAL_SEC  60u     /* 1 min */
+#define SEND_PERIOD_MEASURES  6u      /* backup+send every 6 × 1 min = 6 min */
+#define SLEEP_SECONDS        60
+#else
+/* PROD: measure every 5 min; every 72nd wake (6 h) do backup+send. */
+#define MEASURE_INTERVAL_SEC  300u
+#define SEND_PERIOD_MEASURES  72u
+#define SLEEP_SECONDS        300
+#endif
+
+#if RUN_MODE == RUN_MODE_PROD
+#define SERIAL_PRINT(...)
+#define SERIAL_PRINTLN(...)
+#define SERIAL_BEGIN(...)
+#else
+#define SERIAL_PRINT(...)    SERIAL_PRINT(__VA_ARGS__)
+#define SERIAL_PRINTLN(...)  SERIAL_PRINTLN(__VA_ARGS__)
+#define SERIAL_BEGIN(...)    SERIAL_BEGIN(__VA_ARGS__)
+#endif
 
 // Cayenne LPP: Digital Input = type 0 (1 byte); Analog Input = type 2 (2 bytes, 0.01, MSB first); custom type 128 = 1-min ticks since 2026-01-01 (3 bytes, big-endian)
 #define LPP_DIGITAL_INPUT 0
@@ -168,12 +189,12 @@ const lmic_pinmap lmic_pins = {
 static void userNetworkTimeCallback(void *pUserData, int flagSuccess) {
     (void)pUserData;
     if (flagSuccess != 1) {
-        Serial.println(F("Network time request failed"));
+        SERIAL_PRINTLN(F("Network time request failed"));
         return;
     }
     lmic_time_reference_t lmicTimeRef;
     if (!LMIC_getNetworkTimeReference(&lmicTimeRef)) {
-        Serial.println(F("Network time reference unavailable"));
+        SERIAL_PRINTLN(F("Network time reference unavailable"));
         return;
     }
     /* tNetwork is GPS seconds since 1980-01-06; convert to Unix epoch. */
@@ -183,8 +204,8 @@ static void userNetworkTimeCallback(void *pUserData, int flagSuccess) {
     persistentData.lastTimeSyncEpoch = unixEpoch;
     persistentData.magic = PERSIST_MAGIC;
     persistentStore.write(persistentData);
-    Serial.print(F("RTC synced to epoch: "));
-    Serial.println(unixEpoch);
+    SERIAL_PRINT(F("RTC synced to epoch: "));
+    SERIAL_PRINTLN(unixEpoch);
 }
 
 // Suppress Serial during EV_JOINING..EV_JOINED/FAILED so runloop can service RX windows (~1-2 s after Join Request).
@@ -192,29 +213,29 @@ void onEvent (ev_t ev) {
     static bool joining = false;
     bool quiet = joining && (ev != EV_JOINED && ev != EV_JOIN_FAILED);
     if (!quiet) {
-        Serial.print(os_getTime());
-        Serial.print(": ");
+        SERIAL_PRINT(os_getTime());
+        SERIAL_PRINT(": ");
     }
     switch(ev) {
         case EV_SCAN_TIMEOUT:
-            if (!quiet) Serial.println(F("EV_SCAN_TIMEOUT"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_SCAN_TIMEOUT"));
             break;
         case EV_BEACON_FOUND:
-            if (!quiet) Serial.println(F("EV_BEACON_FOUND"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_BEACON_FOUND"));
             break;
         case EV_BEACON_MISSED:
-            if (!quiet) Serial.println(F("EV_BEACON_MISSED"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_BEACON_MISSED"));
             break;
         case EV_BEACON_TRACKED:
-            if (!quiet) Serial.println(F("EV_BEACON_TRACKED"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_BEACON_TRACKED"));
             break;
         case EV_JOINING:
             joining = true;
-            if (!quiet) Serial.println(F("EV_JOINING"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_JOINING"));
             break;
         case EV_JOINED:
             joining = false;
-            Serial.println(F("EV_JOINED"));
+            SERIAL_PRINTLN(F("EV_JOINED"));
             LMIC_setLinkCheckMode(0);
             persistentData.magic = PERSIST_MAGIC;
             persistentData.netid = (uint32_t)LMIC.netid;
@@ -227,28 +248,28 @@ void onEvent (ev_t ev) {
             {
                 uint8_t helloPayload[] = "HELLO WORLD";
                 LMIC_setTxData2(2, helloPayload, (u1_t)(sizeof(helloPayload) - 1u), 0);
-                if (!quiet) Serial.println(F("HELLO WORLD uplink queued on FPort 2"));
+                if (!quiet) SERIAL_PRINTLN(F("HELLO WORLD uplink queued on FPort 2"));
             }
             break;
         case EV_RFU1:
-            if (!quiet) Serial.println(F("EV_RFU1"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_RFU1"));
             break;
         case EV_JOIN_FAILED:
             joining = false;
-            Serial.println(F("EV_JOIN_FAILED"));
+            SERIAL_PRINTLN(F("EV_JOIN_FAILED"));
             // Retry join after 60 s (no Join Accept in RX window; avoid blocking runloop during join).
             os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(60), do_send);
             break;
         case EV_REJOIN_FAILED:
-            if (!quiet) Serial.println(F("EV_REJOIN_FAILED"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_REJOIN_FAILED"));
             break;
         case EV_TXCOMPLETE:
-            if (!quiet) Serial.println(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
-            if (!quiet && (LMIC.txrxFlags & TXRX_ACK)) Serial.println(F("Received ack"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
+            if (!quiet && (LMIC.txrxFlags & TXRX_ACK)) SERIAL_PRINTLN(F("Received ack"));
             if (!quiet && LMIC.dataLen) {
-                Serial.println(F("Received "));
-                Serial.println(LMIC.dataLen);
-                Serial.println(F(" bytes of payload"));
+                SERIAL_PRINTLN(F("Received "));
+                SERIAL_PRINTLN(LMIC.dataLen);
+                SERIAL_PRINTLN(F(" bytes of payload"));
             }
             /* Send success: clear Flash log so next backup starts fresh. */
             persistentLog.magic = 0;
@@ -261,37 +282,37 @@ void onEvent (ev_t ev) {
             os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(2), do_sleep);
             break;
         case EV_LOST_TSYNC:
-            if (!quiet) Serial.println(F("EV_LOST_TSYNC"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_LOST_TSYNC"));
             break;
         case EV_RESET:
-            if (!quiet) Serial.println(F("EV_RESET"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_RESET"));
             break;
         case EV_RXCOMPLETE:
-            if (!quiet) Serial.println(F("EV_RXCOMPLETE"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_RXCOMPLETE"));
             break;
         case EV_LINK_DEAD:
-            if (!quiet) Serial.println(F("EV_LINK_DEAD"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_LINK_DEAD"));
             break;
         case EV_LINK_ALIVE:
-            if (!quiet) Serial.println(F("EV_LINK_ALIVE"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_LINK_ALIVE"));
             break;
         case 16:
-            if (!quiet) Serial.println(F("EV_SCAN_FOUND (MCCI/extended)"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_SCAN_FOUND (MCCI/extended)"));
             break;
         case 17:
-            if (!quiet) Serial.println(F("EV_TXSTART (radio TX started)"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_TXSTART (radio TX started)"));
             break;
         case 18:
-            if (!quiet) Serial.println(F("EV_TXCANCELED (MCCI/extended)"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_TXCANCELED (MCCI/extended)"));
             break;
         case 19:
-            if (!quiet) Serial.println(F("EV_RXSTART (opening RX window)"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_RXSTART (opening RX window)"));
             break;
         case 20:
-            if (!quiet) Serial.println(F("EV_JOIN_TXCOMPLETE (Join Request sent, waiting Join Accept)"));
+            if (!quiet) SERIAL_PRINTLN(F("EV_JOIN_TXCOMPLETE (Join Request sent, waiting Join Accept)"));
             break;
         default:
-            if (!quiet) { Serial.print(F("Unknown event ")); Serial.println((int)ev); }
+            if (!quiet) { SERIAL_PRINT(F("Unknown event ")); SERIAL_PRINTLN((int)ev); }
             break;
     }
 }
@@ -333,7 +354,7 @@ static uint16_t buildBatchPayload(uint8_t* buf, uint16_t vbatCentivolt, uint8_t 
 
 void do_send(osjob_t* j) {
     if (LMIC.opmode & OP_TXRXPEND) {
-        Serial.println(F("OP_TXRXPEND, not sending"));
+        SERIAL_PRINTLN(F("OP_TXRXPEND, not sending"));
         return;
     }
     /* Request network time at most once per 24 h (TTN fair use). First uplink after join already requested in EV_JOINED. */
@@ -350,13 +371,13 @@ void do_send(osjob_t* j) {
     uint8_t paybuf[2 + 1 + 5 * LOG_SEND_CAP];
     uint16_t payLen = buildBatchPayload(paybuf, vbatCentivolt, n, persistentLog.entries, currentTicks);
 
-    Serial.print(F("Sending batch n="));
-    Serial.print(n);
-    Serial.print(F(" VBat="));
-    Serial.println((float)vbatCentivolt / 100.0f);
+    SERIAL_PRINT(F("Sending batch n="));
+    SERIAL_PRINT(n);
+    SERIAL_PRINT(F(" VBat="));
+    SERIAL_PRINTLN((float)vbatCentivolt / 100.0f);
 
     LMIC_setTxData2(1, paybuf, (uint8_t)payLen, 0);
-    Serial.println(F("Packet queued (batch)"));
+    SERIAL_PRINTLN(F("Packet queued (batch)"));
 }
 
 /** Merge Flash log with RAM buffer, cap at LOG_ENTRIES_MAX, save to Flash, clear RAM. */
@@ -405,12 +426,12 @@ void do_wake(osjob_t* j) {
     persistentData.magic = PERSIST_MAGIC;
     persistentStore.write(persistentData);
 
-    Serial.print(F("Wake #"));
-    Serial.print(persistentData.wakeCounter);
-    Serial.print(F(" ts="));
-    Serial.print(epoch);
-    Serial.print(F(" Temp="));
-    Serial.println(tempC);
+    SERIAL_PRINT(F("Wake #"));
+    SERIAL_PRINT(persistentData.wakeCounter);
+    SERIAL_PRINT(F(" ts="));
+    SERIAL_PRINT(epoch);
+    SERIAL_PRINT(F(" Temp="));
+    SERIAL_PRINTLN(tempC);
 
     if (period == 0) {
         /* SEND_PERIOD_MEASURES-th wake: backup RAM to Flash (merge with any existing), then send. */
@@ -445,9 +466,9 @@ void do_sleep(osjob_t* j) {
 
 
 void setup() {
-    Serial.begin(9600);
+    SERIAL_BEGIN(9600);
     delay(2000);
-    Serial.println(F("Starting"));
+    SERIAL_PRINTLN(F("Starting"));
 
     persistentStore.read(&persistentData);
     haveStoredSession = (persistentData.magic == PERSIST_MAGIC);
@@ -458,8 +479,8 @@ void setup() {
         persistentData.measuresInPeriod = persistentData.measuresInPeriod % SEND_PERIOD_MEASURES;
     }
     logStore.read(&persistentLog);
-    Serial.print(F("Wake #"));
-    Serial.println(persistentData.wakeCounter);
+    SERIAL_PRINT(F("Wake #"));
+    SERIAL_PRINTLN(persistentData.wakeCounter);
 
     rtc.begin();
     if (haveStoredSession && persistentData.rtcEpoch != 0 && persistentData.rtcEpoch != 0xFFFFFFFFu)
@@ -475,7 +496,7 @@ void setup() {
         LMIC_setSession(persistentData.netid, (u4_t)persistentData.devaddr,
                         persistentData.nwkKey, persistentData.artKey);
         LMIC.seqnoUp = (u4_t)persistentData.seqnoUp;
-        Serial.println(F("Session restored from flash"));
+        SERIAL_PRINTLN(F("Session restored from flash"));
     }
 
     pinMode(13, OUTPUT);
