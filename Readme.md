@@ -48,13 +48,13 @@ If the Sketch can't be uploaded, a double click on the reset button of the feath
 
 If you don't have login for The Things Network (TTN), create one.
 
-To adjust the TTN Credentials in the Sketch:
+To adjust the TTN credentials, edit **`app-device-config.h`** (the repo ships placeholders only; do not commit this file after putting real keys—add `app-device-config.h` to `.gitignore` locally if you use real keys):
 
    * In the [TTN Console](https://console.thethingsnetwork.org/), create an application.
-   * Add a device to the application. Give it a Device ID of you choice, click the "Generate" button for Device EUI, leave App Key empty and press "Register".
-   * In the Device Overview, copy the Application EUI to the APPEUI variable in the Sketch in the C-Style lsb format.
-   * In the Device Overview, copy the Device EUI to the DEVEUI variable in the Sketch in the C-Style lsb format.
-   * In the Device Overview, copy the App Key to the APPKEY variable in the Sketch in the C-Style msb format.
+   * Add a device to the application. Give it a Device ID of your choice, click the "Generate" button for Device EUI, leave App Key empty and press "Register".
+   * In the Device Overview, copy the Application EUI into `LORAWAN_APP_EUI_LE` (8 bytes, little-endian).
+   * In the Device Overview, copy the Device EUI into `LORAWAN_DEV_EUI_LE` (8 bytes, little-endian) and `LORAWAN_DEV_EUI` (same value as MSB uint64_t).
+   * In the Device Overview, copy the App Key into `LORAWAN_APP_KEY_ARR` (16 bytes, MSB as from TTN).
 
   ![ttn console](ttn-console-format.png)
 

@@ -15,7 +15,7 @@
  * using frequency and encryption settings matching those of the
  * The Things Network (TTN).
  *
- * This uses OTAA (Over-the-air activation), where where a DevEUI and
+ * This uses OTAA (Over-the-air activation), where a DevEUI and
  * application key is configured, which are used in an over-the-air
  * activation procedure where a DevAddr and session keys are
  * assigned/generated for use with all further communication.
@@ -48,6 +48,7 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <string.h>
+#include "app-device-config.h"
 
 #define VBATPIN A7
 #define ONE_WIRE_BUS 5  /* DS18B20 data on pin 5 (not A5) */
@@ -142,8 +143,7 @@ static uint8_t ramCount;  /* number of valid entries in dataBuffer */
  * wiping the same flash page as the session on SAMD21 (cmaglie FlashStorage erases by slot). */
 #define PERSIST_MAGIC   0x4C4D4943u  /* "LMIC" - legacy; session restore accepted once */
 #define PERSIST_MAGIC_V2 0x4C4D4944u  /* V2: includes devEuiTag; restore only if tag matches current DevEUI */
-/* DevEUI as uint64_t MSB for session tag. Must match DEVEUI below (MSB order); when changing device, update both. */
-#define LORAWAN_DEV_EUI 0x70B3D57ED007560EULL
+/* LORAWAN_DEV_EUI for session tag is in app-device-config.h; must match DEVEUI below. */
 
 typedef struct {
     uint32_t magic;
@@ -173,22 +173,21 @@ typedef struct {
 static PersistentLog_t persistentLog;
 FlashStorage(logStore, PersistentLog_t);
 
-// AppEUI from docs/app-device-config.h (LORAWAN_APP_EUI). Little-endian.
-static const u1_t PROGMEM APPEUI[8] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+// AppEUI / DevEUI / AppKey from app-device-config.h (copy app-device-config.h.example to app-device-config.h and fill from TTN).
+static const u1_t PROGMEM APPEUI[8] = LORAWAN_APP_EUI_LE;
 void os_getArtEui (u1_t* buf) { memcpy_P(buf, APPEUI, 8);}
 
-// DevEUI from docs/app-device-config.h (LORAWAN_DEVICE_EUI "70B3D57ED007560E"). Little-endian.
-static const u1_t PROGMEM DEVEUI[8] = { 0x0E, 0x56, 0x07, 0xD0, 0x7E, 0xD5, 0xB3, 0x70 };
+static const u1_t PROGMEM DEVEUI[8] = LORAWAN_DEV_EUI_LE;
 void os_getDevEui (u1_t* buf) { memcpy_P(buf, DEVEUI, 8);}
 
-// AppKey from docs/app-device-config.h (LORAWAN_APP_KEY). Copied as-is from TTN.
-static const u1_t PROGMEM APPKEY[16] = { 0x72, 0xA5, 0x30, 0xB5, 0xB0, 0xE7, 0xC3, 0x0C, 0x65, 0x2D, 0x66, 0xAD, 0x6D, 0xA9, 0x2C, 0xD5 };
+static const u1_t PROGMEM APPKEY[16] = LORAWAN_APP_KEY_ARR;
 void os_getDevKey (u1_t* buf) { memcpy_P(buf, APPKEY, 16);}
 
 static osjob_t sendjob;
 static bool haveStoredSession;
 
 void do_wake(osjob_t* j);  /* measure, append, then backup+send or sleep */
+void do_send(osjob_t* j);
 
 // Pin mapping
 const lmic_pinmap lmic_pins = {
