@@ -1,5 +1,6 @@
 .vscode/launch.json
 .vscode/arduino.json
 .vscode/c_cpp_properties.json
-docs
 
+app-device-config.h
+docs
