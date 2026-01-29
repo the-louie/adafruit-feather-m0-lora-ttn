@@ -1,0 +1,13 @@
+default_fqbn: adafruit:samd:adafruit_feather_m0
+default_protocol: serial
+
+libraries:
+  - RTCZero
+  - Arduino Low Power
+  - FlashStorage
+  - CayenneLPP
+  - MCCI LoRaWAN LMIC library
+
+profiles:
+  dev:
+    fqbn: adafruit:samd:adafruit_feather_m0
