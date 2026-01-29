@@ -73,16 +73,16 @@ RTCZero rtc;
 
 #if RUN_MODE == RUN_MODE_DEV
 #define MEASURE_INTERVAL_SEC  30u     /* 30 s */
-#define SEND_PERIOD_MEASURES  12u     /* backup+send every 12 × 30 s = 6 min */
+#define SEND_PERIOD_MEASURES  1u      /* upload every wake (measured data + backlog) */
 #define SLEEP_SECONDS        30
 #elif RUN_MODE == RUN_MODE_TEST
-#define MEASURE_INTERVAL_SEC  60u     /* 1 min */
-#define SEND_PERIOD_MEASURES  6u      /* backup+send every 6 × 1 min = 6 min */
-#define SLEEP_SECONDS        60
+#define MEASURE_INTERVAL_SEC  30u     /* 30 s */
+#define SEND_PERIOD_MEASURES  1u      /* upload every wake (measured data + backlog) */
+#define SLEEP_SECONDS        30
 #else
-/* PROD: measure every 5 min; every 72nd wake (6 h) do backup+send. */
+/* PROD: measure every 5 min, upload every 5 min (every wake = measure + upload). */
 #define MEASURE_INTERVAL_SEC  300u
-#define SEND_PERIOD_MEASURES  72u
+#define SEND_PERIOD_MEASURES  1u      /* upload every wake (measured data + backlog) */
 #define SLEEP_SECONDS        300
 #endif
 
@@ -91,9 +91,9 @@ RTCZero rtc;
 #define SERIAL_PRINTLN(...)
 #define SERIAL_BEGIN(...)
 #else
-#define SERIAL_PRINT(...)    SERIAL_PRINT(__VA_ARGS__)
-#define SERIAL_PRINTLN(...)  SERIAL_PRINTLN(__VA_ARGS__)
-#define SERIAL_BEGIN(...)    SERIAL_BEGIN(__VA_ARGS__)
+#define SERIAL_PRINT(...)    Serial.print(__VA_ARGS__)
+#define SERIAL_PRINTLN(...)  Serial.println(__VA_ARGS__)
+#define SERIAL_BEGIN(...)    Serial.begin(__VA_ARGS__)
 #endif
 
 // Cayenne LPP: Digital Input = type 0 (1 byte); Analog Input = type 2 (2 bytes, 0.01, MSB first); custom type 128 = 1-min ticks since 2026-01-01 (3 bytes, big-endian)
@@ -466,6 +466,10 @@ void do_sleep(osjob_t* j) {
 
 
 void setup() {
+#if RUN_MODE == RUN_MODE_DEV
+    /* Give developer time to upload new code before device enters deep sleep (development phase only). */
+    delay(10000);
+#endif
     SERIAL_BEGIN(9600);
     delay(2000);
     SERIAL_PRINTLN(F("Starting"));
