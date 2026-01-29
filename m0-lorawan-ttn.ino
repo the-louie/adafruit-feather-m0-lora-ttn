@@ -65,7 +65,11 @@ RTCZero rtc;
 /* Request network time at most this often (seconds). TTN fair use: once per 24 h is sufficient. */
 #define NETWORK_TIME_REQUEST_INTERVAL_SEC  (24 * 3600)
 
-/* RUN_MODE: DEV = short intervals + Serial; TEST = medium intervals + Serial; PROD = 5 min / 6 h, no Serial. */
+/* RX window clock error: 1 = 1%, 10 = 10%. If Join Accept downlink is missed, try 10 for clock drift. */
+#define CLOCK_ERROR_PERCENT  1
+
+/* RUN_MODE: DEV = short intervals, Serial, 10 s startup delay (upload window; M0 has no boot selector);
+ * TEST = short intervals, Serial, no startup delay; PROD = 5 min, no Serial, no startup delay. */
 #define RUN_MODE_DEV  1
 #define RUN_MODE_TEST 2
 #define RUN_MODE_PROD 3
@@ -130,6 +134,30 @@ static inline void setTick24(LogEntry* e, uint32_t val) {
 static LogEntry dataBuffer[LOG_ENTRIES_MAX];
 static uint8_t ramCount;  /* number of valid entries in dataBuffer */
 
+/* Session store first so it gets the first flash slot; logStore second. Avoids logStore.write() erase
+ * wiping the same flash page as the session on SAMD21 (cmaglie FlashStorage erases by slot). */
+#define PERSIST_MAGIC   0x4C4D4943u  /* "LMIC" – legacy; session restore accepted once */
+#define PERSIST_MAGIC_V2 0x4C4D4944u  /* V2: includes devEuiTag; restore only if tag matches current DevEUI */
+/* DevEUI as uint64_t MSB for session tag. Must match DEVEUI below (MSB order); when changing device, update both. */
+#define LORAWAN_DEV_EUI 0x70B3D57ED007560EULL
+
+typedef struct {
+    uint32_t magic;
+    uint32_t wakeCounter;
+    uint32_t netid;
+    uint32_t devaddr;
+    uint8_t nwkKey[16];
+    uint8_t artKey[16];
+    uint32_t seqnoUp;  /* uplink frame counter; must increase for NS to accept after reset */
+    uint32_t rtcEpoch; /* last known Unix time (seconds since Epoch); restored on boot, updated after TX and after network-time sync */
+    uint32_t lastTimeSyncEpoch; /* last Unix time we got from DeviceTimeAns; used to throttle requests to once per 24 h */
+    uint8_t measuresInPeriod;   /* 0..(SEND_PERIOD_MEASURES-1): wakes since last send; SEND_PERIOD_MEASURES-th triggers backup+send */
+    uint64_t devEuiTag;  /* LORAWAN_DEV_EUI when session was saved; restore only if matches current device */
+} PersistentData_t;
+
+PersistentData_t persistentData;
+FlashStorage(persistentStore, PersistentData_t);
+
 #define LOG_FLASH_MAGIC 0x4C4F4732  /* "LOG2" – 5-byte LogEntry, 1-min tick; LOG1 incompatible */
 typedef struct {
     uint32_t magic;
@@ -152,24 +180,6 @@ void os_getDevEui (u1_t* buf) { memcpy_P(buf, DEVEUI, 8);}
 // AppKey from docs/app-device-config.h (LORAWAN_APP_KEY). Copied as-is from TTN.
 static const u1_t PROGMEM APPKEY[16] = { 0x72, 0xA5, 0x30, 0xB5, 0xB0, 0xE7, 0xC3, 0x0C, 0x65, 0x2D, 0x66, 0xAD, 0x6D, 0xA9, 0x2C, 0xD5 };
 void os_getDevKey (u1_t* buf) { memcpy_P(buf, APPKEY, 16);}
-
-#define PERSIST_MAGIC 0x4C4D4943  // "LMIC"
-
-typedef struct {
-    uint32_t magic;
-    uint32_t wakeCounter;
-    uint32_t netid;
-    uint32_t devaddr;
-    uint8_t nwkKey[16];
-    uint8_t artKey[16];
-    uint32_t seqnoUp;  /* uplink frame counter; must increase for NS to accept after reset */
-    uint32_t rtcEpoch; /* last known Unix time (seconds since Epoch); restored on boot, updated after TX and after network-time sync */
-    uint32_t lastTimeSyncEpoch; /* last Unix time we got from DeviceTimeAns; used to throttle requests to once per 24 h */
-    uint8_t measuresInPeriod;   /* 0..(SEND_PERIOD_MEASURES-1): wakes since last send; SEND_PERIOD_MEASURES-th triggers backup+send */
-} PersistentData_t;
-
-PersistentData_t persistentData;
-FlashStorage(persistentStore, PersistentData_t);
 
 static osjob_t sendjob;
 static bool haveStoredSession;
@@ -202,16 +212,22 @@ static void userNetworkTimeCallback(void *pUserData, int flagSuccess) {
     rtc.setEpoch((time_t)unixEpoch);
     persistentData.rtcEpoch = unixEpoch;
     persistentData.lastTimeSyncEpoch = unixEpoch;
-    persistentData.magic = PERSIST_MAGIC;
+    persistentData.magic = PERSIST_MAGIC_V2;
+    persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
     persistentStore.write(persistentData);
     SERIAL_PRINT(F("RTC synced to epoch: "));
     SERIAL_PRINTLN(unixEpoch);
 }
 
 // Suppress Serial during EV_JOINING..EV_JOINED/FAILED so runloop can service RX windows (~1-2 s after Join Request).
+// In DEV mode always log every event so serial trace is complete (no deep sleep, so USB stays up).
 void onEvent (ev_t ev) {
     static bool joining = false;
+#if RUN_MODE == RUN_MODE_DEV
+    bool quiet = false;  /* DEV: log every event */
+#else
     bool quiet = joining && (ev != EV_JOINED && ev != EV_JOIN_FAILED);
+#endif
     if (!quiet) {
         SERIAL_PRINT(os_getTime());
         SERIAL_PRINT(": ");
@@ -237,13 +253,21 @@ void onEvent (ev_t ev) {
             joining = false;
             SERIAL_PRINTLN(F("EV_JOINED"));
             LMIC_setLinkCheckMode(0);
-            persistentData.magic = PERSIST_MAGIC;
+            SERIAL_PRINTLN(F("[persist] EV_JOINED: filling persistentData (session)"));
+            persistentData.magic = PERSIST_MAGIC_V2;
+            persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
             persistentData.netid = (uint32_t)LMIC.netid;
             persistentData.devaddr = (uint32_t)LMIC.devaddr;
             memcpy(persistentData.nwkKey, LMIC.nwkKey, 16);
             memcpy(persistentData.artKey, LMIC.artKey, 16);
             persistentData.seqnoUp = (uint32_t)LMIC.seqnoUp;
+            SERIAL_PRINT(F("[persist] EV_JOINED: persistentStore.write DevAddr=0x"));
+            SERIAL_PRINT(persistentData.devaddr, HEX);
+            SERIAL_PRINT(F(" SeqNo="));
+            SERIAL_PRINTLN(persistentData.seqnoUp);
             persistentStore.write(persistentData);
+            haveStoredSession = true;  /* so do_wake/do_sleep write V2+tag for rest of this run */
+            SERIAL_PRINTLN(F("[persist] EV_JOINED: haveStoredSession=1"));
             LMIC_requestNetworkTime(userNetworkTimeCallback, NULL);
             {
                 uint8_t helloPayload[] = "HELLO WORLD";
@@ -257,6 +281,7 @@ void onEvent (ev_t ev) {
         case EV_JOIN_FAILED:
             joining = false;
             SERIAL_PRINTLN(F("EV_JOIN_FAILED"));
+            SERIAL_PRINTLN(F("[EV] EV_JOIN_FAILED: schedule do_send (retry) in 60s"));
             // Retry join after 60 s (no Join Accept in RX window; avoid blocking runloop during join).
             os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(60), do_send);
             break;
@@ -267,18 +292,23 @@ void onEvent (ev_t ev) {
             if (!quiet) SERIAL_PRINTLN(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
             if (!quiet && (LMIC.txrxFlags & TXRX_ACK)) SERIAL_PRINTLN(F("Received ack"));
             if (!quiet && LMIC.dataLen) {
-                SERIAL_PRINTLN(F("Received "));
+                SERIAL_PRINT(F("[downlink] received len="));
                 SERIAL_PRINTLN(LMIC.dataLen);
-                SERIAL_PRINTLN(F(" bytes of payload"));
             }
-            /* Send success: clear Flash log so next backup starts fresh. */
-            persistentLog.magic = 0;
-            persistentLog.count = 0;
-            logStore.write(persistentLog);
-            persistentData.magic = PERSIST_MAGIC;
+            /* Persist session first (seqnoUp, rtcEpoch), then clear log. If reset occurs between writes,
+             * we keep the updated session; writing session before log avoids logStore page erase
+             * touching the session slot on SAMD21. */
+            SERIAL_PRINTLN(F("[persist] EV_TXCOMPLETE: persistentStore.write (session)"));
+            persistentData.magic = PERSIST_MAGIC_V2;
+            persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
             persistentData.seqnoUp = (uint32_t)LMIC.seqnoUp;
             persistentData.rtcEpoch = (uint32_t)rtc.getEpoch();
             persistentStore.write(persistentData);
+            SERIAL_PRINTLN(F("[persist] EV_TXCOMPLETE: logStore.write (clear log)"));
+            persistentLog.magic = 0;
+            persistentLog.count = 0;
+            logStore.write(persistentLog);
+            SERIAL_PRINTLN(F("[persist] EV_TXCOMPLETE: schedule do_sleep in 2s"));
             os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(2), do_sleep);
             break;
         case EV_LOST_TSYNC:
@@ -288,7 +318,13 @@ void onEvent (ev_t ev) {
             if (!quiet) SERIAL_PRINTLN(F("EV_RESET"));
             break;
         case EV_RXCOMPLETE:
-            if (!quiet) SERIAL_PRINTLN(F("EV_RXCOMPLETE"));
+            if (!quiet) {
+                SERIAL_PRINTLN(F("EV_RXCOMPLETE"));
+                if (LMIC.dataLen) {
+                    SERIAL_PRINT(F("[downlink] EV_RXCOMPLETE len="));
+                    SERIAL_PRINTLN(LMIC.dataLen);
+                }
+            }
             break;
         case EV_LINK_DEAD:
             if (!quiet) SERIAL_PRINTLN(F("EV_LINK_DEAD"));
@@ -353,8 +389,9 @@ static uint16_t buildBatchPayload(uint8_t* buf, uint16_t vbatCentivolt, uint8_t 
 }
 
 void do_send(osjob_t* j) {
+    SERIAL_PRINTLN(F("[send] do_send entry"));
     if (LMIC.opmode & OP_TXRXPEND) {
-        SERIAL_PRINTLN(F("OP_TXRXPEND, not sending"));
+        SERIAL_PRINTLN(F("[send] OP_TXRXPEND, not sending"));
         return;
     }
     /* Request network time at most once per 24 h (TTN fair use). First uplink after join already requested in EV_JOINED. */
@@ -375,16 +412,24 @@ void do_send(osjob_t* j) {
     SERIAL_PRINT(n);
     SERIAL_PRINT(F(" VBat="));
     SERIAL_PRINTLN((float)vbatCentivolt / 100.0f);
+    SERIAL_PRINT(F("[send] LMIC_setTxData2 port=1 len="));
+    SERIAL_PRINT(payLen);
+    SERIAL_PRINTLN(F(" (uplink)"));
 
     LMIC_setTxData2(1, paybuf, (uint8_t)payLen, 0);
-    SERIAL_PRINTLN(F("Packet queued (batch)"));
+    SERIAL_PRINTLN(F("[send] Packet queued (batch)"));
 }
 
 /** Merge Flash log with RAM buffer, cap at LOG_ENTRIES_MAX, save to Flash, clear RAM. */
 static void mergeBackupAndPrepareSend(void) {
+    SERIAL_PRINTLN(F("[merge] mergeBackupAndPrepareSend entry"));
     logStore.read(&persistentLog);
     uint8_t flashCount = (persistentLog.magic == LOG_FLASH_MAGIC && persistentLog.count <= LOG_ENTRIES_MAX)
         ? persistentLog.count : 0;
+    SERIAL_PRINT(F("[merge] logStore.read flashCount="));
+    SERIAL_PRINT(flashCount);
+    SERIAL_PRINT(F(" ramCount="));
+    SERIAL_PRINTLN(ramCount);
     uint8_t total = flashCount + ramCount;
     if (total > LOG_ENTRIES_MAX) total = LOG_ENTRIES_MAX;
     /* Build merged list: flash entries first, then RAM entries, in a temp buffer. */
@@ -395,6 +440,8 @@ static void mergeBackupAndPrepareSend(void) {
     persistentLog.magic = LOG_FLASH_MAGIC;
     persistentLog.count = i;
     for (uint8_t k = 0; k < i; k++) persistentLog.entries[k] = merged[k];
+    SERIAL_PRINT(F("[merge] logStore.write count="));
+    SERIAL_PRINTLN(i);
     logStore.write(persistentLog);
     ramCount = 0;
 }
@@ -402,9 +449,14 @@ static void mergeBackupAndPrepareSend(void) {
 /** Called after each wake (from setup or after do_sleep). Measure, append to RAM, then either sleep or backup+send. */
 void do_wake(osjob_t* j) {
     (void)j;
+    SERIAL_PRINTLN(F("[wake] do_wake entry"));
     sensors.requestTemperatures();
     float tempC = sensors.getTempCByIndex(0);
     uint32_t epoch = (uint32_t)rtc.getEpoch();
+    SERIAL_PRINT(F("[wake] temp="));
+    SERIAL_PRINT(tempC);
+    SERIAL_PRINT(F(" epoch="));
+    SERIAL_PRINTLN(epoch);
     uint32_t t = (epoch < CUSTOM_EPOCH) ? CUSTOM_EPOCH : epoch;
     uint32_t ticks = (t - CUSTOM_EPOCH) / SECONDS_PER_TICK;
     if (ticks > 0xFFFFFFu) ticks = 0xFFFFFFu;
@@ -423,7 +475,18 @@ void do_wake(osjob_t* j) {
     period = (period + 1) % SEND_PERIOD_MEASURES;
     persistentData.measuresInPeriod = period;
     persistentData.wakeCounter++;
-    persistentData.magic = PERSIST_MAGIC;
+    SERIAL_PRINT(F("[wake] period="));
+    SERIAL_PRINT(period);
+    SERIAL_PRINT(F(" haveStoredSession="));
+    SERIAL_PRINTLN(haveStoredSession ? 1 : 0);
+    if (haveStoredSession) {
+        persistentData.magic = PERSIST_MAGIC_V2;
+        persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
+    } else {
+        persistentData.magic = 0;
+        persistentData.devEuiTag = 0;
+    }
+    SERIAL_PRINTLN(F("[wake] persistentStore.write (wake state)"));
     persistentStore.write(persistentData);
 
     SERIAL_PRINT(F("Wake #"));
@@ -434,16 +497,19 @@ void do_wake(osjob_t* j) {
     SERIAL_PRINTLN(tempC);
 
     if (period == 0) {
+        SERIAL_PRINTLN(F("[wake] period==0 -> mergeBackupAndPrepareSend then do_send"));
         /* SEND_PERIOD_MEASURES-th wake: backup RAM to Flash (merge with any existing), then send. */
         mergeBackupAndPrepareSend();
         do_send(&sendjob);
     } else {
+        SERIAL_PRINTLN(F("[wake] period!=0 -> do_sleep"));
         do_sleep(&sendjob);
     }
 }
 
-// STANDBY sleep via Arduino Low Power (re-inits clocks, RTC wake). Optional: detach USB before
-// sleep for true ~5-15 µA; set DETACH_USB_BEFORE_SLEEP 1 and provide USBDevice if your core has it.
+// STANDBY sleep via Arduino Low Power (re-inits clocks, RTC wake). LMIC's internal time does not
+// advance during deep sleep; if the device refuses to send after wake, check duty cycle / LMIC state.
+// Optional: detach USB before sleep for true ~5-15 µA; set DETACH_USB_BEFORE_SLEEP 1 and provide USBDevice if your core has it.
 #define DETACH_USB_BEFORE_SLEEP 0
 #if DETACH_USB_BEFORE_SLEEP
 #include <USB/USBDevice.h>
@@ -451,9 +517,29 @@ void do_wake(osjob_t* j) {
 
 void do_sleep(osjob_t* j) {
     (void)j;
-    persistentData.magic = PERSIST_MAGIC;
+    SERIAL_PRINTLN(F("[sleep] do_sleep entry"));
+    SERIAL_PRINT(F("[sleep] haveStoredSession="));
+    SERIAL_PRINTLN(haveStoredSession ? 1 : 0);
+    if (haveStoredSession) {
+        persistentData.magic = PERSIST_MAGIC_V2;
+        persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
+    } else {
+        persistentData.magic = 0;
+        persistentData.devEuiTag = 0;
+    }
+    SERIAL_PRINTLN(F("[sleep] persistentStore.write before wait"));
     persistentStore.write(persistentData);
+    /* Allow NVM write to complete before cutting power in deep sleep (SAMD21). */
+    delay(10);
 
+#if RUN_MODE == RUN_MODE_DEV
+    SERIAL_PRINT(F("[sleep] DEV: delay "));
+    SERIAL_PRINT(SLEEP_SECONDS);
+    SERIAL_PRINTLN(F(" s (no deep sleep)"));
+    /* DEV: no deep sleep — stay awake so USB/serial stays connected for logging. */
+    delay((uint32_t)SLEEP_SECONDS * 1000UL);
+    SERIAL_PRINTLN(F("[sleep] DEV: delay done, do_wake"));
+#else
 #if DETACH_USB_BEFORE_SLEEP
     USBDevice.detach();
 #endif
@@ -461,48 +547,76 @@ void do_sleep(osjob_t* j) {
 #if DETACH_USB_BEFORE_SLEEP
     USBDevice.attach();
 #endif
+#endif
     do_wake(&sendjob);
 }
 
 
 void setup() {
 #if RUN_MODE == RUN_MODE_DEV
-    /* Give developer time to upload new code before device enters deep sleep (development phase only). */
+    /* Upload window: 10 s for firmware upload before deep sleep (M0 has no boot selector). */
     delay(10000);
 #endif
     SERIAL_BEGIN(9600);
-    delay(2000);
+#if RUN_MODE == RUN_MODE_DEV
+    delay(2000);  /* allow serial monitor to connect */
+#endif
     SERIAL_PRINTLN(F("Starting"));
-
+    SERIAL_PRINTLN(F("[setup] persistentStore.read"));
     persistentStore.read(&persistentData);
-    haveStoredSession = (persistentData.magic == PERSIST_MAGIC);
+    SERIAL_PRINT(F("[setup] magic=0x"));
+    SERIAL_PRINT(persistentData.magic, HEX);
+    SERIAL_PRINT(F(" devaddr=0x"));
+    SERIAL_PRINT(persistentData.devaddr, HEX);
+    SERIAL_PRINT(F(" seqnoUp="));
+    SERIAL_PRINTLN(persistentData.seqnoUp);
+    /* Accept PERSIST_MAGIC (legacy) or PERSIST_MAGIC_V2. Do not check devEuiTag: with cmaglie FlashStorage
+     * and extended PersistentData_t, the last 8 bytes may read from the next slot (logStore), so devEuiTag
+     * can be wrong and would reject a valid session; accept any V2 to avoid join loop. */
+    haveStoredSession = (persistentData.magic == PERSIST_MAGIC) || (persistentData.magic == PERSIST_MAGIC_V2);
+    SERIAL_PRINT(F("[setup] haveStoredSession="));
+    SERIAL_PRINTLN(haveStoredSession ? 1 : 0);
     if (!haveStoredSession) {
         persistentData.wakeCounter = 0;
         persistentData.measuresInPeriod = 0;
     } else {
         persistentData.measuresInPeriod = persistentData.measuresInPeriod % SEND_PERIOD_MEASURES;
     }
+    SERIAL_PRINTLN(F("[setup] logStore.read"));
     logStore.read(&persistentLog);
     SERIAL_PRINT(F("Wake #"));
     SERIAL_PRINTLN(persistentData.wakeCounter);
 
+    SERIAL_PRINTLN(F("[setup] rtc.begin"));
     rtc.begin();
-    if (haveStoredSession && persistentData.rtcEpoch != 0 && persistentData.rtcEpoch != 0xFFFFFFFFu)
+    if (haveStoredSession && persistentData.rtcEpoch != 0 && persistentData.rtcEpoch != 0xFFFFFFFFu) {
         rtc.setEpoch((time_t)persistentData.rtcEpoch);
-    else
+        SERIAL_PRINT(F("[setup] rtc.setEpoch from flash "));
+        SERIAL_PRINTLN(persistentData.rtcEpoch);
+    } else {
         rtc.setEpoch((time_t)RTC_DEFAULT_EPOCH);
+        SERIAL_PRINTLN(F("[setup] rtc.setEpoch default"));
+    }
 
+    SERIAL_PRINTLN(F("[setup] os_init LMIC_reset LMIC_setClockError"));
     os_init();
     LMIC_reset();
-    LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);
+    LMIC_setClockError(MAX_CLOCK_ERROR * CLOCK_ERROR_PERCENT / 100);
 
     if (haveStoredSession) {
+        SERIAL_PRINTLN(F("[setup] LMIC_setSession (restore from flash)"));
         LMIC_setSession(persistentData.netid, (u4_t)persistentData.devaddr,
                         persistentData.nwkKey, persistentData.artKey);
         LMIC.seqnoUp = (u4_t)persistentData.seqnoUp;
-        SERIAL_PRINTLN(F("Session restored from flash"));
+        SERIAL_PRINT(F("Session restored from flash DevAddr=0x"));
+        SERIAL_PRINT(persistentData.devaddr, HEX);
+        SERIAL_PRINT(F(" SeqNo="));
+        SERIAL_PRINTLN(persistentData.seqnoUp);
+    } else {
+        SERIAL_PRINTLN(F("[setup] no session, will OTAA join"));
     }
 
+    SERIAL_PRINTLN(F("[setup] pinMode sensors.begin do_wake"));
     pinMode(13, OUTPUT);
     digitalWrite(13, HIGH);
     sensors.begin();

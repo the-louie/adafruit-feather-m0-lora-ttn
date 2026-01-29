@@ -1,8 +1,8 @@
 /**
  * TTN / The Things Stack custom payload decoder for M0 batched log uplinks.
  * Payload (big-endian): [vbat_hi, vbat_lo] (V×100), [n], [timeTick_hi, timeTick_mid, timeTick_lo, temp_hi, temp_lo] × n (5 bytes per entry).
- * Temperature: 0–3000 = centidegrees; 0xFFFD => >30°C, 0xFFFE => <0°C, 0xFFFF = error.
- * TimeTick = 1-min ticks since 2026-01-01 00:00:00 UTC (24-bit).
+ * Temperature: 0–3000 = centidegrees (÷100 → °C, 2 decimals); 0xFFFD => >30°C, 0xFFFE => <0°C, 0xFFFF = error.
+ * TimeTick = 1-min ticks since custom epoch; epoch must match firmware CUSTOM_EPOCH (24-bit).
  * When tick is 0 (device RTC not yet synced), timestamp is derived from received_at and 5-min spacing.
  *
  * In Console → Application → Payload Formats → Custom: paste this as decoder.
@@ -37,7 +37,8 @@ function decodeUplink(input) {
   var maxN = ((b.length - 3) / 5) | 0;
   if (n > maxN) n = maxN;
 
-  var customEpoch = new Date('2026-01-01T00:00:00Z').getTime();
+  // Must match firmware CUSTOM_EPOCH (1735689600 = 2025-01-01 00:00:00 UTC); same numeric value in ms.
+  var customEpoch = 1735689600 * 1000;
   var receivedAtMs = null;
   if (input.recvTime && typeof input.recvTime.getTime === 'function') {
     receivedAtMs = input.recvTime.getTime();
@@ -63,7 +64,8 @@ function decodeUplink(input) {
     } else if (temp === 0xFFFD) {
       entries.push({ timestamp: ts, temperature_state: 'over_range' });
     } else {
-      entries.push({ timestamp: ts, temperature_c: temp / 100 });
+      // centidegrees → °C: divide by 100; normalize to 2 decimals (TTN Console may display 1 decimal, truncating)
+      entries.push({ timestamp: ts, temperature_c: Number((temp / 100).toFixed(2)) });
     }
   }
 
