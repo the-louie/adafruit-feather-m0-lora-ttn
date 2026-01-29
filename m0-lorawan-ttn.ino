@@ -93,14 +93,15 @@ RTCZero rtc;
 #define SLEEP_SECONDS        300
 #endif
 
-#if RUN_MODE == RUN_MODE_PROD
-#define SERIAL_PRINT(...)
-#define SERIAL_PRINTLN(...)
-#define SERIAL_BEGIN(...)
-#else
+/* Serial and logging only in DEV; TEST and PROD do not init Serial or log. */
+#if RUN_MODE == RUN_MODE_DEV
 #define SERIAL_PRINT(...)    Serial.print(__VA_ARGS__)
 #define SERIAL_PRINTLN(...)  Serial.println(__VA_ARGS__)
 #define SERIAL_BEGIN(...)    Serial.begin(__VA_ARGS__)
+#else
+#define SERIAL_PRINT(...)
+#define SERIAL_PRINTLN(...)
+#define SERIAL_BEGIN(...)
 #endif
 
 // Cayenne LPP: Digital Input = type 0 (1 byte); Analog Input = type 2 (2 bytes, 0.01, MSB first); custom type 128 = 1-min ticks since 2026-01-01 (3 bytes, big-endian)
@@ -122,7 +123,7 @@ struct __attribute__((packed)) LogEntry {
     uint16_t temperature; /* Centidegrees 0-3000 (0.00-30.00°C); 0xFFFD=>30, 0xFFFE=<0, 0xFFFF=error */
 };
 #define LOG_ENTRIES_MAX 48   /* RAM buffer capacity */
-#define LOG_SEND_CAP     43  /* max entries per uplink (3+5*43=218 bytes ≤ EU868 222) */
+#define LOG_SEND_CAP    43   /* max entries per uplink (3+5*43=218 bytes ≤ EU868 222) */
 
 static inline uint32_t getTick24(const LogEntry* e) {
     return ((uint32_t)(e->timeTick[0]) << 16) | ((uint32_t)(e->timeTick[1]) << 8) | (uint32_t)(e->timeTick[2]);
@@ -139,7 +140,7 @@ static uint8_t ramCount;  /* number of valid entries in dataBuffer */
 
 /* Session store first so it gets the first flash slot; logStore second. Avoids logStore.write() erase
  * wiping the same flash page as the session on SAMD21 (cmaglie FlashStorage erases by slot). */
-#define PERSIST_MAGIC   0x4C4D4943u  /* "LMIC" – legacy; session restore accepted once */
+#define PERSIST_MAGIC   0x4C4D4943u  /* "LMIC" - legacy; session restore accepted once */
 #define PERSIST_MAGIC_V2 0x4C4D4944u  /* V2: includes devEuiTag; restore only if tag matches current DevEUI */
 /* DevEUI as uint64_t MSB for session tag. Must match DEVEUI below (MSB order); when changing device, update both. */
 #define LORAWAN_DEV_EUI 0x70B3D57ED007560EULL
@@ -161,7 +162,7 @@ typedef struct {
 PersistentData_t persistentData;
 FlashStorage(persistentStore, PersistentData_t);
 
-#define LOG_FLASH_MAGIC 0x4C4F4732  /* "LOG2" – 5-byte LogEntry, 1-min tick; LOG1 incompatible */
+#define LOG_FLASH_MAGIC 0x4C4F4732  /* "LOG2" - 5-byte LogEntry, 1-min tick; LOG1 incompatible */
 typedef struct {
     uint32_t magic;
     uint8_t count;
@@ -190,7 +191,6 @@ static bool haveStoredSession;
 void do_wake(osjob_t* j);  /* measure, append, then backup+send or sleep */
 
 // Pin mapping
-
 const lmic_pinmap lmic_pins = {
     .nss = 8,
     .rxtx = LMIC_UNUSED_PIN,
@@ -222,38 +222,26 @@ static void userNetworkTimeCallback(void *pUserData, int flagSuccess) {
     SERIAL_PRINTLN(unixEpoch);
 }
 
-// Suppress Serial during EV_JOINING..EV_JOINED/FAILED so runloop can service RX windows (~1-2 s after Join Request).
-// In DEV mode always log every event so serial trace is complete (no deep sleep, so USB stays up).
 void onEvent (ev_t ev) {
-    static bool joining = false;
-#if RUN_MODE == RUN_MODE_DEV
-    bool quiet = false;  /* DEV: log every event */
-#else
-    bool quiet = joining && (ev != EV_JOINED && ev != EV_JOIN_FAILED);
-#endif
-    if (!quiet) {
-        SERIAL_PRINT(os_getTime());
-        SERIAL_PRINT(": ");
-    }
+    SERIAL_PRINT(os_getTime());
+    SERIAL_PRINT(": ");
     switch(ev) {
         case EV_SCAN_TIMEOUT:
-            if (!quiet) SERIAL_PRINTLN(F("EV_SCAN_TIMEOUT"));
+            SERIAL_PRINTLN(F("EV_SCAN_TIMEOUT"));
             break;
         case EV_BEACON_FOUND:
-            if (!quiet) SERIAL_PRINTLN(F("EV_BEACON_FOUND"));
+            SERIAL_PRINTLN(F("EV_BEACON_FOUND"));
             break;
         case EV_BEACON_MISSED:
-            if (!quiet) SERIAL_PRINTLN(F("EV_BEACON_MISSED"));
+            SERIAL_PRINTLN(F("EV_BEACON_MISSED"));
             break;
         case EV_BEACON_TRACKED:
-            if (!quiet) SERIAL_PRINTLN(F("EV_BEACON_TRACKED"));
+            SERIAL_PRINTLN(F("EV_BEACON_TRACKED"));
             break;
         case EV_JOINING:
-            joining = true;
-            if (!quiet) SERIAL_PRINTLN(F("EV_JOINING"));
+            SERIAL_PRINTLN(F("EV_JOINING"));
             break;
         case EV_JOINED:
-            joining = false;
             SERIAL_PRINTLN(F("EV_JOINED"));
             LMIC_setLinkCheckMode(0);
             SERIAL_PRINTLN(F("[persist] EV_JOINED: filling persistentData (session)"));
@@ -275,26 +263,25 @@ void onEvent (ev_t ev) {
             {
                 uint8_t helloPayload[] = "HELLO WORLD";
                 LMIC_setTxData2(2, helloPayload, (u1_t)(sizeof(helloPayload) - 1u), 0);
-                if (!quiet) SERIAL_PRINTLN(F("HELLO WORLD uplink queued on FPort 2"));
+                SERIAL_PRINTLN(F("HELLO WORLD uplink queued on FPort 2"));
             }
             break;
         case EV_RFU1:
-            if (!quiet) SERIAL_PRINTLN(F("EV_RFU1"));
+            SERIAL_PRINTLN(F("EV_RFU1"));
             break;
         case EV_JOIN_FAILED:
-            joining = false;
             SERIAL_PRINTLN(F("EV_JOIN_FAILED"));
             SERIAL_PRINTLN(F("[EV] EV_JOIN_FAILED: schedule do_send (retry) in 60s"));
             // Retry join after 60 s (no Join Accept in RX window; avoid blocking runloop during join).
             os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(60), do_send);
             break;
         case EV_REJOIN_FAILED:
-            if (!quiet) SERIAL_PRINTLN(F("EV_REJOIN_FAILED"));
+            SERIAL_PRINTLN(F("EV_REJOIN_FAILED"));
             break;
         case EV_TXCOMPLETE:
-            if (!quiet) SERIAL_PRINTLN(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
-            if (!quiet && (LMIC.txrxFlags & TXRX_ACK)) SERIAL_PRINTLN(F("Received ack"));
-            if (!quiet && LMIC.dataLen) {
+            SERIAL_PRINTLN(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
+            if (LMIC.txrxFlags & TXRX_ACK) SERIAL_PRINTLN(F("Received ack"));
+            if (LMIC.dataLen) {
                 SERIAL_PRINT(F("[downlink] received len="));
                 SERIAL_PRINTLN(LMIC.dataLen);
             }
@@ -315,43 +302,42 @@ void onEvent (ev_t ev) {
             os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(2), do_sleep);
             break;
         case EV_LOST_TSYNC:
-            if (!quiet) SERIAL_PRINTLN(F("EV_LOST_TSYNC"));
+            SERIAL_PRINTLN(F("EV_LOST_TSYNC"));
             break;
         case EV_RESET:
-            if (!quiet) SERIAL_PRINTLN(F("EV_RESET"));
+            SERIAL_PRINTLN(F("EV_RESET"));
             break;
         case EV_RXCOMPLETE:
-            if (!quiet) {
-                SERIAL_PRINTLN(F("EV_RXCOMPLETE"));
-                if (LMIC.dataLen) {
-                    SERIAL_PRINT(F("[downlink] EV_RXCOMPLETE len="));
-                    SERIAL_PRINTLN(LMIC.dataLen);
-                }
+            SERIAL_PRINTLN(F("EV_RXCOMPLETE"));
+            if (LMIC.dataLen) {
+                SERIAL_PRINT(F("[downlink] EV_RXCOMPLETE len="));
+                SERIAL_PRINTLN(LMIC.dataLen);
             }
             break;
         case EV_LINK_DEAD:
-            if (!quiet) SERIAL_PRINTLN(F("EV_LINK_DEAD"));
+            SERIAL_PRINTLN(F("EV_LINK_DEAD"));
             break;
         case EV_LINK_ALIVE:
-            if (!quiet) SERIAL_PRINTLN(F("EV_LINK_ALIVE"));
+            SERIAL_PRINTLN(F("EV_LINK_ALIVE"));
             break;
         case 16:
-            if (!quiet) SERIAL_PRINTLN(F("EV_SCAN_FOUND (MCCI/extended)"));
+            SERIAL_PRINTLN(F("EV_SCAN_FOUND (MCCI/extended)"));
             break;
         case 17:
-            if (!quiet) SERIAL_PRINTLN(F("EV_TXSTART (radio TX started)"));
+            SERIAL_PRINTLN(F("EV_TXSTART (radio TX started)"));
             break;
         case 18:
-            if (!quiet) SERIAL_PRINTLN(F("EV_TXCANCELED (MCCI/extended)"));
+            SERIAL_PRINTLN(F("EV_TXCANCELED (MCCI/extended)"));
             break;
         case 19:
-            if (!quiet) SERIAL_PRINTLN(F("EV_RXSTART (opening RX window)"));
+            SERIAL_PRINTLN(F("EV_RXSTART (opening RX window)"));
             break;
         case 20:
-            if (!quiet) SERIAL_PRINTLN(F("EV_JOIN_TXCOMPLETE (Join Request sent, waiting Join Accept)"));
+            SERIAL_PRINTLN(F("EV_JOIN_TXCOMPLETE (Join Request sent, waiting Join Accept)"));
             break;
         default:
-            if (!quiet) { SERIAL_PRINT(F("Unknown event ")); SERIAL_PRINTLN((int)ev); }
+            SERIAL_PRINT(F("Unknown event "));
+            SERIAL_PRINTLN((int)ev);
             break;
     }
 }
@@ -512,8 +498,15 @@ void do_wake(osjob_t* j) {
 
 // STANDBY sleep via Arduino Low Power (re-inits clocks, RTC wake). LMIC's internal time does not
 // advance during deep sleep; if the device refuses to send after wake, check duty cycle / LMIC state.
-// Optional: detach USB before sleep for true ~5-15 µA; set DETACH_USB_BEFORE_SLEEP 1 and provide USBDevice if your core has it.
+// In TEST/PROD Serial is not used but the USB peripheral may still be on (core default). Detach USB
+// before deep sleep for true ~5-15 µA (needs USBDevice from your core). Default: 1 in PROD, 0 in DEV/TEST.
+#ifndef DETACH_USB_BEFORE_SLEEP
+#if RUN_MODE == RUN_MODE_PROD
+#define DETACH_USB_BEFORE_SLEEP 1
+#else
 #define DETACH_USB_BEFORE_SLEEP 0
+#endif
+#endif
 #if DETACH_USB_BEFORE_SLEEP
 #include <USB/USBDevice.h>
 #endif
@@ -539,7 +532,7 @@ void do_sleep(osjob_t* j) {
     SERIAL_PRINT(F("[sleep] DEV: delay "));
     SERIAL_PRINT(SLEEP_SECONDS);
     SERIAL_PRINTLN(F(" s (no deep sleep)"));
-    /* DEV: no deep sleep — stay awake so USB/serial stays connected for logging. */
+    /* DEV: no deep sleep - stay awake so USB/serial stays connected for logging. */
     delay((uint32_t)SLEEP_SECONDS * 1000UL);
     SERIAL_PRINTLN(F("[sleep] DEV: delay done, do_wake"));
 #else
