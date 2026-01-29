@@ -3,6 +3,7 @@
 /*******************************************************************************
  * Copyright (c) 2015 Thomas Telkamp and Matthijs Kooijman
  * Adapted for Adafruit feather m0 LoRa by Stefan Huber
+ * Updated again in 2026 by the_louie
  *
  * Permission is hereby granted, free of charge, to anyone
  * obtaining a copy of this document and accompanying files,
@@ -10,8 +11,9 @@
  * including, but not limited to, copying, modification and redistribution.
  * NO WARRANTY OF ANY KIND IS PROVIDED.
  *
- * This example sends the actual battery voltage, using frequency and
- * encryption settings matching those of the The Things Network.
+ * This example sends the temperature measured by a DS18B20 temperature sensor,
+ * using frequency and encryption settings matching those of the
+ * The Things Network (TTN).
  *
  * This uses OTAA (Over-the-air activation), where where a DevEUI and
  * application key is configured, which are used in an over-the-air
@@ -29,11 +31,12 @@
  *
  * Do not forget to define the radio type correctly in config.h.
  *
- * Batched log (c) 2026: measure every 5 min, append LogEntry (1-min tick + temperature) to RAM; every 6 h backup
- * RAM to Flash, attempt uplink; on success clear Flash, on failure keep Flash and retry in 6 h with next batch merged.
- * Payload: [vbat×100][n][timeTick_3B,temperature × n] big-endian; tick = 1-min since 2026-01-01; temperature = centidegrees 0-3000 or sentinels.
- * RTC keeps time across sleep; epoch persisted in flash. RTC synced via DeviceTimeReq (first after EV_JOINED, ≤1/24 h).
- * Session saved on join, restored on wake.
+ * Batched log (c) 2026 by the_louie:
+ *  - measure every 5 min, append LogEntry (1-min tick + temperature) to RAM; every 6 h backup
+ *  - RAM to Flash, attempt uplink; on success clear Flash, on failure keep Flash and retry in 6 h with next batch merged.
+ *  - Payload: [vbat×100][n][timeTick_3B,temperature × n] big-endian; tick = 1-min since 2026-01-01; temperature = centidegrees 0-3000 or sentinels.
+ *  - RTC keeps time across sleep; epoch persisted in flash. RTC synced via DeviceTimeReq (first after EV_JOINED, ≤1/24 h).
+ *  - Session saved on join, restored on wake.
  *******************************************************************************/
 
 #include <hal/hal.h>
