@@ -1,3 +1,7 @@
+This project is based on [werktag/m0-lorawan-ttn](https://github.com/werktag/m0-lorawan-ttn). We are grateful for that work; this code would not exist without it.
+
+---
+
 # Adafruit Feather M0 LoRa on The Things Network
 
 This tutorial describes how to setup the [Adafruit Feather M0 with RFM95 LoRa Radio](https://www.adafruit.com/product/3178) for [The Things Network](https://www.thethingsnetwork.org/) and transmit batched temperature logs and battery voltage.
