@@ -77,7 +77,7 @@ RTCZero rtc;
 #define RUN_MODE_DEV  1
 #define RUN_MODE_TEST 2
 #define RUN_MODE_PROD 3
-#define RUN_MODE RUN_MODE_DEV
+#define RUN_MODE RUN_MODE_TEST
 
 #if RUN_MODE == RUN_MODE_DEV
 #define MEASURE_INTERVAL_SEC  30u     /* 30 s */
@@ -99,6 +99,11 @@ RTCZero rtc;
 #define SERIAL_PRINT(...)    Serial.print(__VA_ARGS__)
 #define SERIAL_PRINTLN(...)  Serial.println(__VA_ARGS__)
 #define SERIAL_BEGIN(...)    Serial.begin(__VA_ARGS__)
+static void blinkLed(void) {
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(100);
+    digitalWrite(LED_BUILTIN, LOW);
+}
 #else
 #define SERIAL_PRINT(...)
 #define SERIAL_PRINTLN(...)
@@ -260,6 +265,9 @@ void onEvent (ev_t ev) {
             SERIAL_PRINTLN(F("[persist] EV_JOINED: haveStoredSession=1"));
             LMIC_requestNetworkTime(userNetworkTimeCallback, NULL);
             {
+#if RUN_MODE == RUN_MODE_DEV
+                blinkLed();   /* attempting to send */
+#endif
                 uint8_t helloPayload[] = "HELLO WORLD";
                 LMIC_setTxData2(2, helloPayload, (u1_t)(sizeof(helloPayload) - 1u), 0);
                 SERIAL_PRINTLN(F("HELLO WORLD uplink queued on FPort 2"));
@@ -278,6 +286,9 @@ void onEvent (ev_t ev) {
             SERIAL_PRINTLN(F("EV_REJOIN_FAILED"));
             break;
         case EV_TXCOMPLETE:
+#if RUN_MODE == RUN_MODE_DEV
+            blinkLed();   /* send succeeded */
+#endif
             SERIAL_PRINTLN(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
             if (LMIC.txrxFlags & TXRX_ACK) SERIAL_PRINTLN(F("Received ack"));
             if (LMIC.dataLen) {
@@ -404,6 +415,9 @@ void do_send(osjob_t* j) {
     SERIAL_PRINT(payLen);
     SERIAL_PRINTLN(F(" (uplink)"));
 
+#if RUN_MODE == RUN_MODE_DEV
+    blinkLed();   /* attempting to send */
+#endif
     LMIC_setTxData2(1, paybuf, (uint8_t)payLen, 0);
     SERIAL_PRINTLN(F("[send] Packet queued (batch)"));
 }
@@ -612,8 +626,8 @@ void setup() {
     }
 
     SERIAL_PRINTLN(F("[setup] pinMode sensors.begin do_wake"));
-    pinMode(13, OUTPUT);
-    digitalWrite(13, HIGH);
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);   /* DEV: blink on send; TEST/PROD: off */
     sensors.begin();
     ramCount = 0;
     do_wake(&sendjob);
