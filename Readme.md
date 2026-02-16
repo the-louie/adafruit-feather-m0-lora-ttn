@@ -60,14 +60,14 @@ To adjust the TTN credentials, edit **`app-device-config.h`** (the repo ships pl
 
 The sketch uses a **batched log flow**:
 
-- **Measure:** Every 5 min it wakes, reads DS18B20 temperature and RTC, and appends one 5-byte **log entry** (3-byte 1-min tick since 2026-01-01 00:00:00 UTC, 2-byte high-res temperature in centidegrees) into a **RAM buffer** (up to 48 entries).
+- **Measure:** Every 5 min it wakes, reads DS18B20 temperature and RTC, and appends one **log entry** (2-byte temperature, v2.6; time implicit from header baseTick) into a **RAM buffer** (up to 48 entries).
 - **Backup:** On each send wake (with default config, every wake), it merges the current RAM buffer with any unsent data already in **Flash** and saves the combined log back to Flash.
 - **Send:** It builds one uplink with battery voltage plus the batched entries and attempts the LoRaWAN uplink (up to 43 entries per uplink to stay within EU868 payload limit).
 - **Confirm:** On success it clears the Flash log; on failure it keeps the data in Flash and retries on the next send wake with the next batch merged in.
 
-Time is kept by the RTC (RTCZero) across sleep; epoch is persisted in flash and restored after power loss. **RTC is synced from the network** via LoRaWAN DeviceTimeReq/DeviceTimeAns (first after EV_JOINED, then at most once per 24 h). Session is saved on join and restored on wake. Sleep: 5 min (300 s) for all RUN_MODEs (see sketch). **Battery operation:** ensure `DETACH_USB_BEFORE_SLEEP` is enabled (default in PROD) so sleep current reaches ~5–15 µA; otherwise ~10 mA USB leakage. At startup the sketch prints **Starting VBat=…**; below **3.4 V** the sleep interval is doubled (e.g. 600 s). DS18B20 read has a **2 s timeout**; on timeout temperature is sent as error (0xFFFF). **Spreading factor:** Default SF7; if link is dead three times in a row the next uplink uses SF8 for one cycle (better for weak coverage), then back to SF7. **Cold Boot test:** pull battery, reattach; verify device joins at SF7 and resumes correct seqnoUp from flash (no drift); after 3× EV_LINK_DEAD the next cycle may use SF8.
+Time is kept by the RTC (RTCZero) across sleep; epoch is persisted in flash and restored after power loss. **RTC is synced from the network** via LoRaWAN DeviceTimeReq/DeviceTimeAns (first after EV_JOINED, then at most once per 24 h). Session is saved on join and restored on wake. Sleep: 5 min (300 s) for all RUN_MODEs (see sketch). **Battery operation:** ensure `DETACH_USB_BEFORE_SLEEP` is enabled (default in PROD) so sleep current reaches ~5–15 µA; otherwise ~10 mA USB leakage. At startup the sketch prints **Starting VBat=…**; below **3.4 V** the sleep interval is doubled (e.g. 600 s); below **3.2 V** (critical) the device skips TX and sleeps 600 s to avoid brown-out during LoRa burst. **BOD33** is set to 2.7 V for clean shutdown during TX. DS18B20 read has a **2 s timeout**; on timeout temperature is sent as error (0xFFFF). **Spreading factor:** Default SF7; if link is dead three times in a row the next uplink uses SF8 for one cycle (better for weak coverage), then back to SF7. **Cold Boot test:** pull battery, reattach; verify device joins at SF7 and resumes correct seqnoUp from flash (no drift); after 3× EV_LINK_DEAD the next cycle may use SF8.
 
-**Payload format** (big-endian): `[vbat_hi, vbat_lo]` (battery × 100, 0.01 V), `[n]` (entry count, 0–43), then for each entry `[timeTick_hi, timeTick_mid, timeTick_lo, temp_hi, temp_lo]` (5 bytes). Tick = 1-min since 2026-01-01 00:00:00 UTC (24-bit). Temperature: 0–3000 = 0.00–30.00°C (centidegrees); 0xFFFD = &gt;30°C, 0xFFFE = &lt;0°C, 0xFFFF = error. Typical size e.g. 2+1+5×12 = 63 bytes for 12 entries.
+**Payload format (v2.6 implicit time)** (big-endian): `[vbat_hi, vbat_lo]` (battery × 100), `[n]` (entry count, 0–43), `[baseTick_hi, baseTick_mid, baseTick_lo]` (24-bit 1-min tick for first entry), then for each entry `[temp_hi, temp_lo]` (2 bytes). Entry *i* timestamp = baseTick + *i*×5 minutes since epoch. Temperature: 0–3000 = centidegrees; 0xFFFD/0xFFFE/0xFFFF = over/under/error. Max size 6+2×43 = 92 bytes. **You must use the v2.6 decoder** from [`ttn-decoder-batch.js`](ttn-decoder-batch.js) (implicit-time format); older decoders will not parse correctly.
 
 In [TTN Console](https://console.thethingsnetwork.org/) (or [The Things Stack](https://console.thethings.network/)) → Application → Payload Formats: set to **Custom** and paste the decoder from [`ttn-decoder-batch.js`](ttn-decoder-batch.js), or use this:
 
@@ -90,14 +90,15 @@ function decodeUplink(input) {
     return { data: { message: text } };
   }
 
-  if (b.length < 3) return { data: {} };
+  if (b.length < 6 || (b.length - 6) % 2 !== 0) return { data: {} };
 
   var battery_v = (((b[0] << 8) | b[1]) >>> 0) / 100;
   var n = b[2] & 0xFF;
-  var maxN = ((b.length - 3) / 5) | 0;
+  var baseTick = ((b[3] << 16) | (b[4] << 8) | b[5]) >>> 0;
+  var maxN = (b.length - 6) >> 1;
   if (n > maxN) n = maxN;
 
-  var customEpoch = new Date('2026-01-01T00:00:00Z').getTime();
+  var customEpoch = 1735689600 * 1000;
   var receivedAtMs = null;
   if (input.recvTime && typeof input.recvTime.getTime === 'function') {
     receivedAtMs = input.recvTime.getTime();
@@ -106,15 +107,15 @@ function decodeUplink(input) {
   }
 
   var entries = [];
-  for (var i = 0, j = 3; i < n && j + 5 <= b.length; i++, j += 5) {
-    var ticks = ((b[j] << 16) | (b[j + 1] << 8) | b[j + 2]) >>> 0;
-    var temp = ((b[j + 3] << 8) | b[j + 4]) >>> 0;
+  for (var i = 0; i < n; i++) {
+    var j = 6 + i * 2;
+    var temp = ((b[j] << 8) | b[j + 1]) >>> 0;
     var ts;
-    if (ticks === 0 && receivedAtMs !== null && n > 0) {
+    if (baseTick === 0 && receivedAtMs !== null && n > 0) {
       var offsetMs = (n - 1 - i) * 300 * 1000;
       ts = new Date(receivedAtMs - offsetMs).toISOString();
     } else {
-      ts = new Date(customEpoch + ticks * 60 * 1000).toISOString();
+      ts = new Date(customEpoch + (baseTick + i * 5) * 60 * 1000).toISOString();
     }
     if (temp === 0xFFFF) {
       entries.push({ timestamp: ts, temperature_state: 'error' });
@@ -123,7 +124,7 @@ function decodeUplink(input) {
     } else if (temp === 0xFFFD) {
       entries.push({ timestamp: ts, temperature_state: 'over_range' });
     } else {
-      entries.push({ timestamp: ts, temperature_c: temp / 100 });
+      entries.push({ timestamp: ts, temperature_c: Number((temp / 100).toFixed(2)) });
     }
   }
 
