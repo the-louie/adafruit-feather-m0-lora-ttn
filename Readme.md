@@ -42,7 +42,7 @@ For the battery/sleep/Cayenne LPP version, install from **Library Manager** (Ske
 Now it's time to verify the sketch and upload it onto your feather.
 If the Sketch can't be uploaded, a double click on the reset button of the feather might help. The blinking red LED indicates that your feather is in bootloader state and ready to be programmed.
 
-## Getting the credentials form The Things Network
+## Getting the credentials from The Things Network
 
 If you don't have login for The Things Network (TTN), create one.
 
@@ -65,7 +65,7 @@ The sketch uses a **batched log flow**:
 - **Send:** It builds one uplink with battery voltage plus the batched entries and attempts the LoRaWAN uplink (up to 43 entries per uplink to stay within EU868 payload limit).
 - **Confirm:** On success it clears the Flash log; on failure it keeps the data in Flash and retries on the next send wake with the next batch merged in.
 
-Time is kept by the RTC (RTCZero) across sleep; epoch is persisted in flash and restored after power loss. **RTC is synced from the network** via LoRaWAN DeviceTimeReq/DeviceTimeAns (first after EV_JOINED, then at most once per 24 h). Session is saved on join and restored on wake. Sleep: 30 s when `RUN_MODE` is RUN_MODE_DEV; 5 min when RUN_MODE_TEST or RUN_MODE_PROD (see sketch).
+Time is kept by the RTC (RTCZero) across sleep; epoch is persisted in flash and restored after power loss. **RTC is synced from the network** via LoRaWAN DeviceTimeReq/DeviceTimeAns (first after EV_JOINED, then at most once per 24 h). Session is saved on join and restored on wake. Sleep: 5 min (300 s) for all RUN_MODEs (see sketch).
 
 **Payload format** (big-endian): `[vbat_hi, vbat_lo]` (battery × 100, 0.01 V), `[n]` (entry count, 0–43), then for each entry `[timeTick_hi, timeTick_mid, timeTick_lo, temp_hi, temp_lo]` (5 bytes). Tick = 1-min since 2026-01-01 00:00:00 UTC (24-bit). Temperature: 0–3000 = 0.00–30.00°C (centidegrees); 0xFFFD = &gt;30°C, 0xFFFE = &lt;0°C, 0xFFFF = error. Typical size e.g. 2+1+5×12 = 63 bytes for 12 entries.
 

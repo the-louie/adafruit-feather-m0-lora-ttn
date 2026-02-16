@@ -9,6 +9,8 @@ typedef struct LogEntryS AppLogEntry;
 
 #include <lmic.h>
 
+/* Firmware v2.4 – duty cycle / deep sleep per Technical Review 2026-02-16. */
+
 /*******************************************************************************
  * Copyright (c) 2015 Thomas Telkamp and Matthijs Kooijman
  * Adapted for Adafruit feather m0 LoRa by Stefan Huber
@@ -41,13 +43,13 @@ typedef struct LogEntryS AppLogEntry;
  * Set region and radio in the MCCI LMIC library: lmic_project_config.h (CFG_eu868, CFG_sx1276_radio).
  *
  * Batched log (c) 2026 by the_louie:
- *  - measure every 5 min (TEST/PROD) or 30 s (DEV), append log entry (1-min tick + temperature) to RAM; on send wake merge RAM to Flash, attempt uplink; on success clear Flash, on failure keep Flash and retry next send wake.
+ *  - measure every 5 min (DEV, TEST, PROD), append log entry (1-min tick + temperature) to RAM; on send wake merge RAM to Flash, attempt uplink; on success clear Flash, on failure keep Flash and retry next send wake.
  *  - Payload: [vbat×100][n][timeTick_3B,temperature × n] big-endian; tick = 1-min since 2026-01-01; temperature = centidegrees 0-3000 or sentinels.
  *  - RTC keeps time across sleep; epoch persisted in flash. RTC synced via DeviceTimeReq (first after EV_JOINED, ≤1/24 h).
  *  - Session saved on join, restored on wake.
  *
- * TTN / LMIC behaviour: Report interval 5 min (TEST and PROD) to stay within EU868 duty cycle
- * and avoid wake deadlocks; DEV uses 30 s for rapid iteration. SeqNo is persisted in EV_TXCOMPLETE
+ * TTN / LMIC behaviour: Report interval 5 min (DEV, TEST, PROD) to stay within EU868 duty cycle
+ * and avoid wake deadlocks. SeqNo is persisted in EV_TXCOMPLETE
  * only when the completed TX was application data (FPort > 0); MAC-only completions skip flash
  * to avoid NVM stress during MAC storms. do_sleep forces LMIC reset if radio stays busy > 6 s
  * (MAC loop recovery); that run skips session persist. ADR is off in RUN_MODE_TEST to reduce
@@ -93,7 +95,7 @@ RTCZero rtc;
 
 /* RX window clock error: 15% in setup() for Feather M0 internal oscillator; compensates for crystal drift over long runs (e.g. 36 h). */
 
-/* RUN_MODE: DEV = short intervals (30 s), Serial, 10 s startup delay (upload window; M0 has no boot selector);
+/* RUN_MODE: DEV = 5 min, Serial, 10 s startup delay (upload window; M0 has no boot selector);
  * TEST = 5 min, Serial, no startup delay; PROD = 5 min, no Serial, no startup delay.
  * For 36-hour validation and production, set RUN_MODE to RUN_MODE_TEST or RUN_MODE_PROD; 300 s ensures EU868 1% airtime is cleared before the next wake so the device can transmit and return to deep sleep without deadlock. */
 #define RUN_MODE_DEV  1
@@ -102,9 +104,9 @@ RTCZero rtc;
 #define RUN_MODE RUN_MODE_DEV
 
 #if RUN_MODE == RUN_MODE_DEV
-#define MEASURE_INTERVAL_SEC  30u     /* 30 s */
+#define MEASURE_INTERVAL_SEC  300u    /* 5 min */
 #define SEND_PERIOD_MEASURES  1u      /* upload every wake (measured data + backlog) */
-#define SLEEP_SECONDS        30
+#define SLEEP_SECONDS        300      /* 5 min */
 #elif RUN_MODE == RUN_MODE_TEST
 #define MEASURE_INTERVAL_SEC  300u    /* 5 min: aligns with EU868 duty cycle, avoids wake deadlocks */
 #define SEND_PERIOD_MEASURES  1u      /* upload every wake (measured data + backlog) */
@@ -465,7 +467,7 @@ void do_send(osjob_t* j) {
         return;
     }
     do_send_pend_retries = 0;
-    /* 5-min cycle (TEST/PROD) keeps EU868 duty within limits; DEV uses 30 s for rapid iteration. */
+    /* 5-min cycle (DEV, TEST, PROD) keeps EU868 duty within limits. */
     /* Request network time at most once per 24 h (TTN fair use). First uplink after join already requested in EV_JOINED. */
     uint32_t nowEpoch = (uint32_t)rtc.getEpoch();
     uint32_t lastSync = persistentData.lastTimeSyncEpoch;
@@ -607,7 +609,7 @@ void do_wake(osjob_t* j) {
 #include <USB/USBDevice.h>
 #endif
 
-/* do_sleep: radio can stay busy in a MAC handshake; after 3×2 s we force LMIC reset and proceed (skipPersist that run). Radio busy: force reset after 6 s to recover from MAC loop. With 300 s (TEST/PROD) interval, EU868 1% duty is satisfied by the next wake so the device can TX and return to deep sleep (e.g. 15 µA) without extended busy-wait. */
+/* do_sleep: radio can stay busy in a MAC handshake; after 3×2 s we force LMIC reset and proceed (skipPersist that run). Radio busy: force reset after 6 s to recover from MAC loop. With 300 s (DEV, TEST, PROD) interval, EU868 1% duty is satisfied by the next wake so the device can TX and return to deep sleep (e.g. 15 µA) without extended busy-wait. */
 void do_sleep(osjob_t* j) {
     (void)j;
     SERIAL_PRINTLN(F("[sleep] do_sleep entry"));
