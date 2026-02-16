@@ -49,7 +49,7 @@ typedef struct LogEntryS AppLogEntry;
  *  - Session saved on join, restored on wake.
  *
  * TTN / LMIC behaviour: Report interval 5 min (DEV, TEST, PROD) to stay within EU868 duty cycle
- * and avoid wake deadlocks. SeqNo is persisted in EV_TXCOMPLETE
+ * and avoid wake deadlocks. In RUN_MODE_TEST, ADR is off and SF7 is forced (shortest ToA). SeqNo is persisted in EV_TXCOMPLETE
  * only when the completed TX was application data (FPort > 0); MAC-only completions skip flash
  * to avoid NVM stress during MAC storms. do_sleep forces LMIC reset if radio stays busy > 6 s
  * (MAC loop recovery); that run skips session persist. ADR is off in RUN_MODE_TEST to reduce
@@ -290,6 +290,7 @@ void onEvent (ev_t ev) {
             LMIC_setLinkCheckMode(1);
 #if RUN_MODE == RUN_MODE_TEST
             LMIC_setAdrMode(0);   /* ADR off in TEST to reduce MAC load */
+            LMIC_setDrTxpow(5, 14);  /* Force SF7 (EU868 DR5), 14 dBm: shortest ToA (~56 ms), minimal duty wait */
 #else
             LMIC_setAdrMode(1);
 #endif
@@ -527,6 +528,10 @@ static void mergeBackupAndPrepareSend(void) {
 /** Called after each wake (from setup or after do_sleep). Measure, append to RAM, then either sleep or backup+send. */
 void do_wake(osjob_t* j) {
     (void)j;
+#if RUN_MODE == RUN_MODE_DEV
+    SERIAL_PRINT(F("[DEV] Wake @ millis="));
+    SERIAL_PRINTLN(millis());
+#endif
     SERIAL_PRINTLN(F("[wake] do_wake entry"));
 #if RUN_MODE == RUN_MODE_TEST
     /* Battery test: skip DS18B20 read to save current. */
@@ -650,10 +655,11 @@ void do_sleep(osjob_t* j) {
     }
 
 #if RUN_MODE == RUN_MODE_DEV
-    SERIAL_PRINT(F("[sleep] DEV: delay "));
+    SERIAL_PRINT(F("[DEV] Entering sleep wait — "));
     SERIAL_PRINT(SLEEP_SECONDS);
-    SERIAL_PRINTLN(F(" s (no deep sleep)"));
-    /* DEV: run runloop so radio and Serial stay responsive; avoids radio window lock during wait. */
+    SERIAL_PRINT(F(" s @ millis="));
+    SERIAL_PRINTLN(millis());
+    /* DEV: wait only, no radio/LMIC (simulates deep sleep); CPU stays awake so Serial remains connected. */
     {
         uint32_t start = millis();
         uint32_t durationMs = (uint32_t)SLEEP_SECONDS * 1000UL;
@@ -664,10 +670,11 @@ void do_sleep(osjob_t* j) {
                 SERIAL_PRINTLN(F("[heartbeat] 5 min – no TX"));
                 lastHeartbeatMs = millis();
             }
-            os_runloop_once();
+            delay(100);
         }
     }
-    SERIAL_PRINTLN(F("[sleep] DEV: delay done, do_wake"));
+    SERIAL_PRINT(F("[DEV] Sleep wait over — waking @ millis="));
+    SERIAL_PRINTLN(millis());
 #else
 #if DETACH_USB_BEFORE_SLEEP
     USBDevice.detach();
