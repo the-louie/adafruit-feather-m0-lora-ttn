@@ -20,7 +20,7 @@ If you power the Feather via **VUSB** from an external battery (e.g. USB power b
 
 ### DS18B20 temperature sensor (optional)
 
-To add a DS18B20 one-wire temperature sensor, use **Pin 5** for the data line. Alternatives: Pin 10, 11, or 12. Pins 3, 4, 6, 8, and 9 are in use by the LoRa radio or battery sense. Wiring: DS18B20 data → chosen pin; **4.7 kΩ** resistor from data to **3V**; GND → GND; VDD → **3V** (3.3 V operation). Install **Dallas Temperature** (Miles Burton) and **OneWire** (Paul Stoffregen) from Library Manager. See [DS18B20 pin and wiring](docs/ds18b20-pin-and-wiring.md) for details.
+To add a DS18B20 one-wire temperature sensor, use **Pin 5** for the data line. Alternatives: Pin 10, 11, or 12. Pins 3, 4, 6, 8, and 9 are in use by the LoRa radio or battery sense. Wiring: DS18B20 data → chosen pin; **4.7 kΩ** pull-up from data to **3V** (required to avoid sensor hang / -127.00); GND → GND; VDD → **3V** (3.3 V operation). Install **Dallas Temperature** (Miles Burton) and **OneWire** (Paul Stoffregen) from Library Manager. See [DS18B20 pin and wiring](docs/ds18b20-pin-and-wiring.md) for details.
 
 ## How to set up a working development environment for the Feather M0 LoRa
 
@@ -65,7 +65,7 @@ The sketch uses a **batched log flow**:
 - **Send:** It builds one uplink with battery voltage plus the batched entries and attempts the LoRaWAN uplink (up to 43 entries per uplink to stay within EU868 payload limit).
 - **Confirm:** On success it clears the Flash log; on failure it keeps the data in Flash and retries on the next send wake with the next batch merged in.
 
-Time is kept by the RTC (RTCZero) across sleep; epoch is persisted in flash and restored after power loss. **RTC is synced from the network** via LoRaWAN DeviceTimeReq/DeviceTimeAns (first after EV_JOINED, then at most once per 24 h). Session is saved on join and restored on wake. Sleep: 5 min (300 s) for all RUN_MODEs (see sketch).
+Time is kept by the RTC (RTCZero) across sleep; epoch is persisted in flash and restored after power loss. **RTC is synced from the network** via LoRaWAN DeviceTimeReq/DeviceTimeAns (first after EV_JOINED, then at most once per 24 h). Session is saved on join and restored on wake. Sleep: 5 min (300 s) for all RUN_MODEs (see sketch). **Battery operation:** ensure `DETACH_USB_BEFORE_SLEEP` is enabled (default in PROD) so sleep current reaches ~5–15 µA; otherwise ~10 mA USB leakage. At startup the sketch prints **Starting VBat=…**; below **3.4 V** the sleep interval is doubled (e.g. 600 s). DS18B20 read has a **2 s timeout**; on timeout temperature is sent as error (0xFFFF). **Spreading factor:** Default SF7; if link is dead three times in a row the next uplink uses SF8 for one cycle (better for weak coverage), then back to SF7. **Cold Boot test:** pull battery, reattach; verify device joins at SF7 and resumes correct seqnoUp from flash (no drift); after 3× EV_LINK_DEAD the next cycle may use SF8.
 
 **Payload format** (big-endian): `[vbat_hi, vbat_lo]` (battery × 100, 0.01 V), `[n]` (entry count, 0–43), then for each entry `[timeTick_hi, timeTick_mid, timeTick_lo, temp_hi, temp_lo]` (5 bytes). Tick = 1-min since 2026-01-01 00:00:00 UTC (24-bit). Temperature: 0–3000 = 0.00–30.00°C (centidegrees); 0xFFFD = &gt;30°C, 0xFFFE = &lt;0°C, 0xFFFF = error. Typical size e.g. 2+1+5×12 = 63 bytes for 12 entries.
 
