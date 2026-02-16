@@ -1,3 +1,12 @@
+/* Log entry type: defined before any #include so no library (e.g. LMIC) macro can shadow AppLogEntry. */
+struct LogEntryS {
+    uint8_t timeTick[3];
+    uint16_t temperature;
+} __attribute__((packed));
+typedef struct LogEntryS AppLogEntry;
+#define LOG_ENTRIES_MAX 48
+#define LOG_SEND_CAP    43
+
 #include <lmic.h>
 
 /*******************************************************************************
@@ -29,25 +38,27 @@
  * Multiple devices can use the same AppEUI, but each device has its own
  * DevEUI and AppKey.
  *
- * Do not forget to define the radio type correctly in config.h.
+ * Set region and radio in the MCCI LMIC library: lmic_project_config.h (CFG_eu868, CFG_sx1276_radio).
  *
  * Batched log (c) 2026 by the_louie:
- *  - measure every 5 min, append LogEntry (1-min tick + temperature) to RAM; every 6 h backup
- *  - RAM to Flash, attempt uplink; on success clear Flash, on failure keep Flash and retry in 6 h with next batch merged.
+ *  - measure every 5 min (TEST/PROD) or 30 s (DEV), append log entry (1-min tick + temperature) to RAM; on send wake merge RAM to Flash, attempt uplink; on success clear Flash, on failure keep Flash and retry next send wake.
  *  - Payload: [vbat×100][n][timeTick_3B,temperature × n] big-endian; tick = 1-min since 2026-01-01; temperature = centidegrees 0-3000 or sentinels.
  *  - RTC keeps time across sleep; epoch persisted in flash. RTC synced via DeviceTimeReq (first after EV_JOINED, ≤1/24 h).
  *  - Session saved on join, restored on wake.
  *
- * TTN / LMIC behaviour: SeqNo (frame counter) is persisted on every EV_TXCOMPLETE so a reset
- * before do_sleep does not roll back; TTN v3 drops uplinks with lower or equal counter. Link
- * Check and ADR are enabled after join. EV_LINK_DEAD triggers LMIC_reset and re-join. do_send
- * limits OP_TXRXPEND retries (e.g. after brown-out) then resets LMIC. RX2 for OTAA is taken from
- * Join Accept. Clock error 15% (MAX_CLOCK_ERROR from LMIC) for Feather M0 internal oscillator.
+ * TTN / LMIC behaviour: Report interval 5 min (TEST and PROD) to stay within EU868 duty cycle
+ * and avoid wake deadlocks; DEV uses 30 s for rapid iteration. SeqNo is persisted in EV_TXCOMPLETE
+ * only when the completed TX was application data (FPort > 0); MAC-only completions skip flash
+ * to avoid NVM stress during MAC storms. do_sleep forces LMIC reset if radio stays busy > 6 s
+ * (MAC loop recovery); that run skips session persist. ADR is off in RUN_MODE_TEST to reduce
+ * MAC load. Link Check on after join. EV_LINK_DEAD triggers LMIC_reset and re-join. do_send
+ * limits OP_TXRXPEND retries then resets LMIC. RX2 from Join Accept. Clock error 15% for Feather
+ * M0 internal oscillator.
  *
- * If updates stop: (1) TTN Console Live Data: "Join Request without Join Accept" = timing/clock;
- * "Uplink dropped" = frame counter. (2) Device very close to gateway (under 3 m) can desensitize
- * it; try another room. (3) SPI shared (Flash + LoRa); avoid logStore.write overlapping RFM95
- * DIO. (4) Brown-out during TX (120 mA) can corrupt RFM95; consider supply decoupling.
+ * If updates stop: (1) TTN Live Data: "Join Request without Join Accept" = timing/clock;
+ * "Uplink dropped" = frame counter. (2) Confirm DIO1 (RFM95) to pin 6 (M0); without it no RX.
+ * (3) Device very close to gateway (under 3 m) can desensitize; try another room. (4) SPI
+ * shared (Flash + LoRa). (5) Brown-out during TX (120 mA) can corrupt RFM95; supply decoupling.
  *******************************************************************************/
 
 #include <hal/hal.h>
@@ -82,21 +93,22 @@ RTCZero rtc;
 
 /* RX window clock error: 15% in setup() for Feather M0 internal oscillator; compensates for crystal drift over long runs (e.g. 36 h). */
 
-/* RUN_MODE: DEV = short intervals, Serial, 10 s startup delay (upload window; M0 has no boot selector);
- * TEST = short intervals, Serial, no startup delay; PROD = 5 min, no Serial, no startup delay. */
+/* RUN_MODE: DEV = short intervals (30 s), Serial, 10 s startup delay (upload window; M0 has no boot selector);
+ * TEST = 5 min, Serial, no startup delay; PROD = 5 min, no Serial, no startup delay.
+ * For 36-hour validation and production, set RUN_MODE to RUN_MODE_TEST or RUN_MODE_PROD; 300 s ensures EU868 1% airtime is cleared before the next wake so the device can transmit and return to deep sleep without deadlock. */
 #define RUN_MODE_DEV  1
 #define RUN_MODE_TEST 2
 #define RUN_MODE_PROD 3
-#define RUN_MODE RUN_MODE_TEST
+#define RUN_MODE RUN_MODE_DEV
 
 #if RUN_MODE == RUN_MODE_DEV
 #define MEASURE_INTERVAL_SEC  30u     /* 30 s */
 #define SEND_PERIOD_MEASURES  1u      /* upload every wake (measured data + backlog) */
 #define SLEEP_SECONDS        30
 #elif RUN_MODE == RUN_MODE_TEST
-#define MEASURE_INTERVAL_SEC  30u     /* 30 s */
+#define MEASURE_INTERVAL_SEC  300u    /* 5 min: aligns with EU868 duty cycle, avoids wake deadlocks */
 #define SEND_PERIOD_MEASURES  1u      /* upload every wake (measured data + backlog) */
-#define SLEEP_SECONDS        30
+#define SLEEP_SECONDS        300     /* 5 min */
 #else
 /* PROD: measure every 5 min, upload every 5 min (every wake = measure + upload). */
 #define MEASURE_INTERVAL_SEC  300u
@@ -133,25 +145,17 @@ static void blinkLed(void) {
 #define TEMP_ENCODED_SCALE 8.43f
 #define TEMP_ENCODED_OFFSET 3
 
-/** One log entry: 3-byte 1-min tick and 2-byte high-res temperature. Packed 5-byte layout. */
-struct __attribute__((packed)) LogEntry {
-    uint8_t timeTick[3];  /* 1-min tick since 2026-01-01 00:00:00 UTC, big-endian */
-    uint16_t temperature; /* Centidegrees 0-3000 (0.00-30.00°C); 0xFFFD=>30, 0xFFFE=<0, 0xFFFF=error */
-};
-#define LOG_ENTRIES_MAX 48   /* RAM buffer capacity */
-#define LOG_SEND_CAP    43   /* max entries per uplink (3+5*43=218 bytes ≤ EU868 222) */
-
-static inline uint32_t getTick24(const LogEntry* e) {
+static inline uint32_t getTick24(const AppLogEntry* e) {
     return ((uint32_t)(e->timeTick[0]) << 16) | ((uint32_t)(e->timeTick[1]) << 8) | (uint32_t)(e->timeTick[2]);
 }
-static inline void setTick24(LogEntry* e, uint32_t val) {
+static inline void setTick24(AppLogEntry* e, uint32_t val) {
     val &= 0xFFFFFFu;
     e->timeTick[0] = (uint8_t)(val >> 16);
     e->timeTick[1] = (uint8_t)(val >> 8);
     e->timeTick[2] = (uint8_t)(val);
 }
 
-static LogEntry dataBuffer[LOG_ENTRIES_MAX];
+static AppLogEntry dataBuffer[LOG_ENTRIES_MAX];
 static uint8_t ramCount;  /* number of valid entries in dataBuffer */
 
 /* Session store first so it gets the first flash slot; logStore second. Avoids logStore.write() erase
@@ -177,12 +181,12 @@ typedef struct {
 PersistentData_t persistentData;
 FlashStorage(persistentStore, PersistentData_t);
 
-#define LOG_FLASH_MAGIC 0x4C4F4732  /* "LOG2" - 5-byte LogEntry, 1-min tick; LOG1 incompatible */
+#define LOG_FLASH_MAGIC 0x4C4F4732  /* "LOG2" - 5-byte AppLogEntry, 1-min tick; LOG1 incompatible */
 typedef struct {
     uint32_t magic;
     uint8_t count;
     uint8_t reserved[3];
-    LogEntry entries[LOG_ENTRIES_MAX];
+    AppLogEntry entries[LOG_ENTRIES_MAX];
 } PersistentLog_t;
 
 static PersistentLog_t persistentLog;
@@ -205,6 +209,9 @@ static bool haveStoredSession;
 #define DO_SEND_PEND_RETRY_MAX 3
 static uint8_t do_send_pend_retries;
 
+/** FPort of last application TX (do_send=1, post_join_first_uplink=2). MAC-only (Port 0) completions do not set this; we only persist to flash when lastTxFPort > 0. */
+static uint8_t lastTxFPort;
+
 /** One-shot: queue HELLO WORLD on FPort 2 after join. TTN: allow NS to finalize session before first data. */
 static void post_join_first_uplink(osjob_t* j);
 
@@ -212,7 +219,7 @@ void do_wake(osjob_t* j);  /* measure, append, then backup+send or sleep */
 void do_send(osjob_t* j);
 void do_sleep(osjob_t* j);
 
-/** Commit session to flash. Call only when haveStoredSession: after join, in EV_TXCOMPLETE, or when measuresInPeriod==0 in do_sleep. Reads LMIC/rtc at call time. */
+/** Commit session to flash. Call sites: EV_JOINED; EV_TXCOMPLETE only when last TX was application (lastTxFPort > 0); do_sleep when measuresInPeriod==0 && haveStoredSession && !skipPersist (skipped after forced radio reset). Reads LMIC/rtc at call time. */
 static void save_session_to_flash(void) {
     if (!haveStoredSession) return;
     persistentData.magic = PERSIST_MAGIC_V2;
@@ -224,12 +231,12 @@ static void save_session_to_flash(void) {
     delay(20);
 }
 
-// Pin mapping
+/* Pin mapping: Feather M0 LoRa. DIO1 (RFM95) must be jumped to Pin 6 for RX and LMIC events. */
 const lmic_pinmap lmic_pins = {
     .nss = 8,
     .rxtx = LMIC_UNUSED_PIN,
     .rst = LMIC_UNUSED_PIN,
-    .dio = {3,6,LMIC_UNUSED_PIN},
+    .dio = {3, 6, LMIC_UNUSED_PIN},
 };
 
 /* Callback when DeviceTimeAns is received. LMIC gives GPS seconds; convert to Unix and set RTC. Throttle requests to once per 24 h. */
@@ -277,8 +284,13 @@ void onEvent (ev_t ev) {
             break;
         case EV_JOINED:
             SERIAL_PRINTLN(F("EV_JOINED"));
+            lastTxFPort = 0;
             LMIC_setLinkCheckMode(1);
+#if RUN_MODE == RUN_MODE_TEST
+            LMIC_setAdrMode(0);   /* ADR off in TEST to reduce MAC load */
+#else
             LMIC_setAdrMode(1);
+#endif
             SERIAL_PRINTLN(F("[persist] EV_JOINED: filling persistentData (session)"));
             persistentData.magic = PERSIST_MAGIC_V2;
             persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
@@ -319,16 +331,24 @@ void onEvent (ev_t ev) {
                 SERIAL_PRINT(F("[downlink] received len="));
                 SERIAL_PRINTLN(LMIC.dataLen);
             }
-            /* Update session in RAM and commit to flash immediately so reset before do_sleep does not roll back seqnoUp (TTN drops duplicate/lower frame counter). */
+            /* Update session in RAM; commit to flash only when completed TX was application (FPort > 0) to avoid NVM stress during MAC storms. */
             persistentData.magic = PERSIST_MAGIC_V2;
             persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
             persistentData.seqnoUp = (uint32_t)LMIC.seqnoUp;
             persistentData.rtcEpoch = (uint32_t)rtc.getEpoch();
-            save_session_to_flash();
-            SERIAL_PRINTLN(F("[persist] EV_TXCOMPLETE: logStore.write (clear log)"));
-            persistentLog.magic = 0;
-            persistentLog.count = 0;
-            logStore.write(persistentLog);
+            if (lastTxFPort > 0u) {
+                save_session_to_flash();
+                SERIAL_PRINTLN(F("[persist] App data sent. Committing SeqNo."));
+                if (lastTxFPort == 1u) {
+                    SERIAL_PRINTLN(F("[persist] EV_TXCOMPLETE: logStore.write (clear log)"));
+                    persistentLog.magic = 0;
+                    persistentLog.count = 0;
+                    logStore.write(persistentLog);
+                }
+                lastTxFPort = 0;
+            } else {
+                SERIAL_PRINTLN(F("[persist] MAC-only response. Skipping flash."));
+            }
             SERIAL_PRINTLN(F("[persist] EV_TXCOMPLETE: schedule do_sleep in 2s"));
             os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(2), do_sleep);
             break;
@@ -383,6 +403,7 @@ static void post_join_first_uplink(osjob_t* j) {
     blinkLed();
 #endif
     uint8_t helloPayload[] = "HELLO WORLD";
+    lastTxFPort = 2;
     LMIC_setTxData2(2, helloPayload, (u1_t)(sizeof(helloPayload) - 1u), 0);
     SERIAL_PRINTLN(F("HELLO WORLD uplink queued on FPort 2 (post-join)"));
 }
@@ -401,7 +422,7 @@ static uint16_t encodeTemperatureHighRes(float tempC) {
 /** Build batched payload: [vbat_hi,vbat_lo][n][timeTick_hi,timeTick_mid,timeTick_lo,temp_hi,temp_lo] × n, big-endian. Max 2+1+5*LOG_SEND_CAP bytes.
  * If currentTicks is valid (<= 0xFFFFFF), entries with tick==0 (recorded before RTC sync) get a plausible tick
  * from current time and 1-min spacing: entry k (0=oldest) uses currentTicks - (n - 1 - k), clamped to 0. */
-static uint16_t buildBatchPayload(uint8_t* buf, uint16_t vbatCentivolt, uint8_t n, const LogEntry* entries, uint32_t currentTicks) {
+static uint16_t buildBatchPayload(uint8_t* buf, uint16_t vbatCentivolt, uint8_t n, const AppLogEntry* entries, uint32_t currentTicks) {
     uint16_t i = 0;
     buf[i++] = (uint8_t)(vbatCentivolt >> 8);
     buf[i++] = (uint8_t)(vbatCentivolt & 0xFF);
@@ -444,6 +465,7 @@ void do_send(osjob_t* j) {
         return;
     }
     do_send_pend_retries = 0;
+    /* 5-min cycle (TEST/PROD) keeps EU868 duty within limits; DEV uses 30 s for rapid iteration. */
     /* Request network time at most once per 24 h (TTN fair use). First uplink after join already requested in EV_JOINED. */
     uint32_t nowEpoch = (uint32_t)rtc.getEpoch();
     uint32_t lastSync = persistentData.lastTimeSyncEpoch;
@@ -469,6 +491,7 @@ void do_send(osjob_t* j) {
 #if RUN_MODE == RUN_MODE_DEV
     blinkLed();   /* attempting to send */
 #endif
+    lastTxFPort = 1;
     LMIC_setTxData2(1, paybuf, (uint8_t)payLen, 0);
     SERIAL_PRINTLN(F("[send] Packet queued (batch)"));
 }
@@ -486,7 +509,7 @@ static void mergeBackupAndPrepareSend(void) {
     uint8_t total = flashCount + ramCount;
     if (total > LOG_ENTRIES_MAX) total = LOG_ENTRIES_MAX;
     /* Build merged list: flash entries first, then RAM entries, in a temp buffer. */
-    LogEntry merged[LOG_ENTRIES_MAX];
+    AppLogEntry merged[LOG_ENTRIES_MAX];
     uint8_t i = 0;
     for (uint8_t k = 0; k < flashCount && i < total; k++) merged[i++] = persistentLog.entries[k];
     for (uint8_t k = 0; k < ramCount && i < total; k++) merged[i++] = dataBuffer[k];
@@ -519,7 +542,7 @@ void do_wake(osjob_t* j) {
     uint32_t t = (epoch < CUSTOM_EPOCH) ? CUSTOM_EPOCH : epoch;
     uint32_t ticks = (t - CUSTOM_EPOCH) / SECONDS_PER_TICK;
     if (ticks > 0xFFFFFFu) ticks = 0xFFFFFFu;
-    LogEntry e;
+    AppLogEntry e;
     setTick24(&e, (uint32_t)ticks);
 #if RUN_MODE == RUN_MODE_TEST
     e.temperature = 0xFFFFu;  /* sentinel: no sensor read in battery test */
@@ -530,7 +553,7 @@ void do_wake(osjob_t* j) {
     if (ramCount < LOG_ENTRIES_MAX) {
         dataBuffer[ramCount++] = e;
     } else {
-        memmove(dataBuffer, &dataBuffer[1], (LOG_ENTRIES_MAX - 1) * sizeof(LogEntry));
+        memmove(dataBuffer, &dataBuffer[1], (LOG_ENTRIES_MAX - 1) * sizeof(AppLogEntry));
         dataBuffer[LOG_ENTRIES_MAX - 1] = e;
     }
 
@@ -584,19 +607,41 @@ void do_wake(osjob_t* j) {
 #include <USB/USBDevice.h>
 #endif
 
+/* do_sleep: radio can stay busy in a MAC handshake; after 3×2 s we force LMIC reset and proceed (skipPersist that run). Radio busy: force reset after 6 s to recover from MAC loop. With 300 s (TEST/PROD) interval, EU868 1% duty is satisfied by the next wake so the device can TX and return to deep sleep (e.g. 15 µA) without extended busy-wait. */
 void do_sleep(osjob_t* j) {
     (void)j;
     SERIAL_PRINTLN(F("[sleep] do_sleep entry"));
-    /* Do not enter deep sleep while radio is busy (TX/RX or joining). */
+    static uint8_t busy_retries = 0;
+    bool skipPersist = false;
+#if defined(OP_TXDATA)
+    if ((LMIC.opmode & (OP_TXRXPEND | OP_TXDATA)) != 0) {
+#else
     if ((LMIC.opmode & OP_TXRXPEND) != 0) {
-        SERIAL_PRINTLN(F("[sleep] Radio busy, delaying sleep..."));
-        os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(2), do_sleep);
-        return;
+#endif
+        SERIAL_PRINT(F("[sleep] opmode=0x"));
+        SERIAL_PRINTLN((unsigned)LMIC.opmode, HEX);
+        busy_retries++;
+        if (busy_retries <= 3) {
+            SERIAL_PRINTLN(F("[sleep] Radio busy, retrying in 2s..."));
+            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(2), do_sleep);
+            return;
+        }
+        SERIAL_PRINTLN(F("[sleep] Radio STUCK. Resetting LMIC."));
+        busy_retries = 0;
+        LMIC_reset();
+        LMIC_setClockError(MAX_CLOCK_ERROR * 15 / 100);
+        if (haveStoredSession) {
+            LMIC_setSession(persistentData.netid, (u4_t)persistentData.devaddr, persistentData.nwkKey, persistentData.artKey);
+            LMIC.seqnoUp = (u4_t)persistentData.seqnoUp;
+        }
+        skipPersist = true;
+    } else {
+        busy_retries = 0;
     }
     SERIAL_PRINTLN(F("[sleep] Radio idle. Proceeding to Deep Sleep."));
     SERIAL_PRINT(F("[sleep] haveStoredSession="));
     SERIAL_PRINTLN(haveStoredSession ? 1 : 0);
-    if (persistentData.measuresInPeriod == 0u && haveStoredSession) {
+    if (persistentData.measuresInPeriod == 0u && haveStoredSession && !skipPersist) {
         save_session_to_flash();  /* includes delay(20) */
     } else {
         delay(10);  /* allow any prior NVM write to complete before deep sleep (SAMD21) */
@@ -606,8 +651,20 @@ void do_sleep(osjob_t* j) {
     SERIAL_PRINT(F("[sleep] DEV: delay "));
     SERIAL_PRINT(SLEEP_SECONDS);
     SERIAL_PRINTLN(F(" s (no deep sleep)"));
-    /* DEV: no deep sleep - stay awake so USB/serial stays connected for logging. */
-    delay((uint32_t)SLEEP_SECONDS * 1000UL);
+    /* DEV: run runloop so radio and Serial stay responsive; avoids radio window lock during wait. */
+    {
+        uint32_t start = millis();
+        uint32_t durationMs = (uint32_t)SLEEP_SECONDS * 1000UL;
+        static uint32_t lastHeartbeatMs = 0;
+        while (millis() - start < durationMs) {
+            if (lastHeartbeatMs == 0u) lastHeartbeatMs = millis();
+            else if ((uint32_t)(millis() - lastHeartbeatMs) >= 300000UL) {
+                SERIAL_PRINTLN(F("[heartbeat] 5 min – no TX"));
+                lastHeartbeatMs = millis();
+            }
+            os_runloop_once();
+        }
+    }
     SERIAL_PRINTLN(F("[sleep] DEV: delay done, do_wake"));
 #else
 #if DETACH_USB_BEFORE_SLEEP
@@ -632,8 +689,13 @@ void setup() {
     delay(2000);  /* allow serial monitor to connect */
 #endif
     SERIAL_PRINTLN(F("Starting"));
+    lastTxFPort = 0;
+    SERIAL_PRINT(F("[setup] sizeof(AppLogEntry)="));
+    SERIAL_PRINTLN((unsigned)sizeof(AppLogEntry));
     SERIAL_PRINTLN(F("[setup] persistentStore.read"));
     persistentStore.read(&persistentData);
+    SERIAL_PRINT(F("[setup] seqnoUp from flash: "));
+    SERIAL_PRINTLN(persistentData.seqnoUp);
     SERIAL_PRINT(F("[setup] magic=0x"));
     SERIAL_PRINT(persistentData.magic, HEX);
     SERIAL_PRINT(F(" devaddr=0x"));

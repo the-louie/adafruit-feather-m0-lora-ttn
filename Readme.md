@@ -35,9 +35,7 @@ Setup the Arduino IDE with the necessary libraries: Follow the [tutorial](https:
 
 Clone this Arduino Sketch: `git clone https://github.com/werktag/m0-lorawan-ttn`
 
-Clone the lmic library adjusted for the Feather M0 LoRa into your Arduino library folder: `git clone https://github.com/huebe/arduino-lmic` (The Arduino library folder is usually be found in `Documents\Arduino\libraries` in Windows, and `~/Arduino/libraries` in Linux)
-
-The changes to the original lmic library are a slower SPI speed and the correct radio settings.
+**LMIC library (MCCI LoRaWAN LMIC):** This sketch uses the **MCCI LoRaWAN LMIC library** (v4.1.1 or newer). Install it via **Library Manager** (Sketch → Include Library → Manage Libraries): search for **"MCCI LoRaWAN LMIC library"** and install. If you previously used "IBM LMIC framework" or "arduino-lmic", uninstall them in Manage Libraries and remove any folders named `arduino-lmic` or `IBM_LMIC` from your Arduino libraries directory (e.g. `Documents\Arduino\libraries` on Windows, `~/Arduino/libraries` on Linux) to avoid header conflicts. After installing MCCI LMIC, you must set the region and radio in the library: open `lmic_project_config.h` inside the library (typically `.../libraries/MCCI_LoRaWAN_LMIC_library/project_config/lmic_project_config.h`) and ensure only **EU868** and **SX1276** are enabled, e.g. `#define CFG_eu868 1` and `#define CFG_sx1276_radio 1`; other region/radio defines should be 0 or commented out. See [MCCI LMIC configuration](docs/mcci-lmic-config.md) for details.
 
 For the battery/sleep/Cayenne LPP version, install from **Library Manager** (Sketch → Include Library → Manage Libraries): search **"RTCZero"** → Install (by Arduino); search **"FlashStorage"** → Install (by cmaglie, for SAMD21 flash). Both are required; they are not bundled with the Adafruit SAMD board package.
 
@@ -62,12 +60,12 @@ To adjust the TTN credentials, edit **`app-device-config.h`** (the repo ships pl
 
 The sketch uses a **batched log flow**:
 
-- **Measure:** Every 5 min it wakes, reads DS18B20 temperature and RTC, and appends one 5-byte **LogEntry** (3-byte 1-min tick since 2026-01-01 00:00:00 UTC, 2-byte high-res temperature in centidegrees) into a **RAM buffer** (up to 48 entries).
-- **Backup:** Every 6 h (every 72nd wake), before sending, it merges the current RAM buffer with any unsent data already in **Flash** and saves the combined log back to Flash.
+- **Measure:** Every 5 min it wakes, reads DS18B20 temperature and RTC, and appends one 5-byte **log entry** (3-byte 1-min tick since 2026-01-01 00:00:00 UTC, 2-byte high-res temperature in centidegrees) into a **RAM buffer** (up to 48 entries).
+- **Backup:** On each send wake (with default config, every wake), it merges the current RAM buffer with any unsent data already in **Flash** and saves the combined log back to Flash.
 - **Send:** It builds one uplink with battery voltage plus the batched entries and attempts the LoRaWAN uplink (up to 43 entries per uplink to stay within EU868 payload limit).
-- **Confirm:** On success it clears the Flash log; on failure it keeps the data in Flash and retries in 6 h with the next batch merged in.
+- **Confirm:** On success it clears the Flash log; on failure it keeps the data in Flash and retries on the next send wake with the next batch merged in.
 
-Time is kept by the RTC (RTCZero) across sleep; epoch is persisted in flash and restored after power loss. **RTC is synced from the network** via LoRaWAN DeviceTimeReq/DeviceTimeAns (first after EV_JOINED, then at most once per 24 h). Session is saved on join and restored on wake. Sleep: 30 s in development (`USE_DEV_SLEEP 1`), 5 min in production (`USE_DEV_SLEEP 0`).
+Time is kept by the RTC (RTCZero) across sleep; epoch is persisted in flash and restored after power loss. **RTC is synced from the network** via LoRaWAN DeviceTimeReq/DeviceTimeAns (first after EV_JOINED, then at most once per 24 h). Session is saved on join and restored on wake. Sleep: 30 s when `RUN_MODE` is RUN_MODE_DEV; 5 min when RUN_MODE_TEST or RUN_MODE_PROD (see sketch).
 
 **Payload format** (big-endian): `[vbat_hi, vbat_lo]` (battery × 100, 0.01 V), `[n]` (entry count, 0–43), then for each entry `[timeTick_hi, timeTick_mid, timeTick_lo, temp_hi, temp_lo]` (5 bytes). Tick = 1-min since 2026-01-01 00:00:00 UTC (24-bit). Temperature: 0–3000 = 0.00–30.00°C (centidegrees); 0xFFFD = &gt;30°C, 0xFFFE = &lt;0°C, 0xFFFF = error. Typical size e.g. 2+1+5×12 = 63 bytes for 12 entries.
 
@@ -139,7 +137,7 @@ The decoded `battery_v` and `entries[]` (each with `timestamp` and `temperature_
 
 That's it, enjoy LoRaWAN with your feather!
 
-If the gateway receives 0 packets or joins fail, check: DIO1→D6 wiring, 8.2 cm antenna for 868 MHz, use of **huebe/arduino-lmic** (not another LMIC), Feather M0 as board, and EU868 / Europe 863–870 MHz in TTN. See project `docs/dev-notes/` (e.g. `20260127-debug-m0-ttn-gateway-zero-packets.md`) for a debug checklist.
+If the gateway receives 0 packets or joins fail, check: DIO1→D6 wiring (IO1 to Pin 6), 8.2 cm antenna for 868 MHz, use of **MCCI LoRaWAN LMIC library** with EU868 and SX1276 in `lmic_project_config.h`, Feather M0 as board, and EU868 / Europe 863–870 MHz in TTN. See project `docs/dev-notes/` (e.g. `20260127-debug-m0-ttn-gateway-zero-packets.md`) for a debug checklist.
 
 If you see **`as.up.data.decode.fail`**, ensure the application uses **Custom** payload formatter with the batched decoder above (not built-in Cayenne LPP).
 
