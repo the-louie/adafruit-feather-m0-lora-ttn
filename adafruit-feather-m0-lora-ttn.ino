@@ -10,7 +10,7 @@ typedef struct LogEntryS AppLogEntry;
 /* No-op when LMIC does not provide LMIC_disableDutyCycle. To enable duty-cycle bypass, use a library that provides it and replace with LMIC_disableDutyCycle(). */
 #define APP_DISABLE_LMIC_DUTY_CYCLE() ((void)0)
 
-/* Firmware v3.2.1 – v3.2 commissioning priority; app watchdog 10s after EV_TXSTART when haveStoredSession (any radio TX; not armed during join); 90s safety timer in EV_JOINED removed. Stay-awake until haveStoredSession && validationCycles>=2; do_send does not force sleep on OP_TXRXPEND when !haveStoredSession. 12s join watchdog. Join-first; 90 s join budget; delta sleep. FIRMWARE_VERSION_V32 mismatch in setup() forces validationCycles=0. */
+/* Firmware v3.3.0 – Hardware-strapped run mode (pins 11/12 GND-strap). Single binary; 0 µA pin leakage after read; reset-cause filtering (PM->RCAUSE). FIRMWARE_VERSION_V330 mismatch forces validationCycles=0. */
 
 /*******************************************************************************
  * Copyright (c) 2015 Thomas Telkamp and Matthijs Kooijman
@@ -69,12 +69,18 @@ typedef struct LogEntryS AppLogEntry;
 #include <DallasTemperature.h>
 #include <string.h>
 #include "app-device-config.h"
+#include "hw-device-config.h"
+/* No explicit #include <USB/USBDevice.h>; on SAMD21 the USBDevice object is provided by the core (Arduino.h). */
+#if defined(USBCON)
+#define HAVE_USB_DEVICE 1
+#else
+#define HAVE_USB_DEVICE 0
+#endif
 
 #define VBATPIN A7
 #define VBAT_VOLTS() (analogRead(VBATPIN) * (2.0f * 3.3f / 1024.0f))
 #define VBAT_LOW_THRESHOLD_V 3.4f  /* Below this we double sleep interval to preserve capacity. */
 #define VBAT_CRITICAL_THRESHOLD_V 3.2f  /* Below this skip TX (brown-out risk), sleep 600 s. */
-#define ONE_WIRE_BUS 5  /* DS18B20 data on pin 5 (not A5). 4.7 kΩ pull-up data→3V required to avoid hang. */
 #define DS18B20_READ_TIMEOUT_MS 2000  /* Max wait for conversion; on timeout use sentinel (0xFFFF). */
 
 OneWire oneWire(ONE_WIRE_BUS);
@@ -82,31 +88,17 @@ DallasTemperature sensors(&oneWire);
 
 /* 20% clock error for Feather M0 internal oscillator: Join Accept and MAC downlinks (e.g. ADR, LinkCheckAns) need wider RX window. */
 
-/* RUN_MODE: DEV = 5 min, TEST = 5 min, PROD = 3 h. FPort 10 = 300 s, FPort 20 = 10800 s (decoder interval mapping). */
-#define RUN_MODE_DEV  1
-#define RUN_MODE_TEST 2
-#define RUN_MODE_PROD 3
-#define RUN_MODE RUN_MODE_TEST
+/* Run mode from hardware strapping (pins 11/12) at cold boot; DEV/TEST = 5 min FPort 10, PROD = 3 h FPort 20. Senior-dev convention: PROD=1, DEV=2, TEST=3. */
+#define RUN_MODE_PROD 1
+#define RUN_MODE_DEV  2
+#define RUN_MODE_TEST 3
 
 #define FPORT_INTERVAL_5MIN  10   /* 300 s interval; decoder uses FPort to infer interval. */
 #define FPORT_INTERVAL_3H    20   /* 10800 s (3 h) interval. */
 #define INTERVAL_SEC_DEV_TEST  300u
 #define INTERVAL_SEC_PROD      10800u  /* TTN decoder must use same FPort→interval: FPort 10 = 300 s, FPort 20 = 10800 s; change ttn-decoder-batch.js if PROD interval changes. */
 
-#if RUN_MODE == RUN_MODE_DEV
-#define MEASURE_INTERVAL_SEC  300u
-#define SEND_PERIOD_MEASURES  1u
-#define SLEEP_SECONDS        300
-#elif RUN_MODE == RUN_MODE_TEST
-#define MEASURE_INTERVAL_SEC  300u
-#define SEND_PERIOD_MEASURES  1u
-#define SLEEP_SECONDS        300
-#else
-/* PROD: 3 h measure/send interval. */
-#define MEASURE_INTERVAL_SEC  10800u
-#define SEND_PERIOD_MEASURES  1u
-#define SLEEP_SECONDS         10800
-#endif
+#define SEND_PERIOD_MEASURES  1u  /* Same in all modes; interval comes from configureIntervals(). */
 
 /* EU868 data rate indices: DR5=SF7 (default), DR4=SF8 (one cycle after 3× EV_LINK_DEAD). */
 #define SF7_DR_EU868 5
@@ -116,32 +108,26 @@ DallasTemperature sensors(&oneWire);
 #define APP_WATCHDOG_AFTER_TX_SEC 10u  /* Data/MAC TX: 10s after EV_TXSTART. Covers standard RX1 (1s/5s) and RX2 (2s/6s) windows with margin. */
 #define APP_WATCHDOG_JOIN_SEC 12u      /* Join: 12s after EV_JOIN_TXCOMPLETE (RX1+RX2+Feather M0 processing margin) */
 
-/* Serial and logging only in DEV; TEST and PROD do not init Serial or log. */
-#if RUN_MODE == RUN_MODE_DEV
-#define SERIAL_PRINT(...)    Serial.print(__VA_ARGS__)
-#define SERIAL_PRINTLN(...)  Serial.println(__VA_ARGS__)
-#define SERIAL_BEGIN(...)    Serial.begin(__VA_ARGS__)
+/* Serial only when runMode == RUN_MODE_DEV (runtime); Serial.begin() called only in setup when DEV. Single binary. */
+#define SERIAL_PRINT(...)    do { if (persistentData.runMode == RUN_MODE_DEV) Serial.print(__VA_ARGS__); } while(0)
+#define SERIAL_PRINTLN(...)  do { if (persistentData.runMode == RUN_MODE_DEV) Serial.println(__VA_ARGS__); } while(0)
+#define SERIAL_BEGIN(...)    do { if (persistentData.runMode == RUN_MODE_DEV) Serial.begin(__VA_ARGS__); } while(0)
 static void blinkLed(void) {
     digitalWrite(LED_BUILTIN, HIGH);
     delay(100);
     digitalWrite(LED_BUILTIN, LOW);
 }
-#else
-#define SERIAL_PRINT(...)
-#define SERIAL_PRINTLN(...)
-#define SERIAL_BEGIN(...)
-#endif
 
 static AppLogEntry dataBuffer[LOG_ENTRIES_MAX];
 static uint8_t ramCount;  /* number of valid entries in dataBuffer */
 
 /* Session store first so it gets the first flash slot; logStore second. Avoids logStore.write() erase
  * wiping the same flash page as the session on SAMD21 (cmaglie FlashStorage erases by slot). */
-#define PERSIST_MAGIC   0x4C4D4943u  /* "LMIC" - legacy; session restore accepted once */
-#define PERSIST_MAGIC_V2 0x4C4D4944u  /* V2: includes devEuiTag; restore only if tag matches current DevEUI */
+#define PERSIST_MAGIC   0x4C4D4943u  /* "LMIC" - legacy; not used for session restore (V2 only). */
+#define PERSIST_MAGIC_V2 0x4C4D4944u  /* V2: session restore only when magic==V2 and devaddr!=0. */
 /* LORAWAN_DEV_EUI for session tag is in app-device-config.h; must match DEVEUI below. */
-/** v3.2: Version marker; mismatch in setup() forces validationCycles=0 (first boot after flash or firmware upgrade). */
-#define FIRMWARE_VERSION_V32 0x00030200u
+/** v3.3.0: Version marker; mismatch in setup() forces validationCycles=0 (first boot after flash or firmware upgrade). Only version constant in use. */
+#define FIRMWARE_VERSION_V330 0x00030300u
 
 typedef struct {
     uint32_t magic;
@@ -154,7 +140,9 @@ typedef struct {
     uint8_t measuresInPeriod;   /* 0..(SEND_PERIOD_MEASURES-1): wakes since last send; SEND_PERIOD_MEASURES-th triggers backup+send */
     uint64_t devEuiTag;  /* LORAWAN_DEV_EUI when session was saved; restore only if matches current device */
     uint8_t validationCycles;   /* Number of completed application TX cycles after join; deep sleep allowed when >= 2. */
-    uint32_t lastFirmwareVersion;  /* FIRMWARE_VERSION_V32 when saved; mismatch forces validation period. */
+    uint8_t runMode;            /* Runtime mode from hardware strapping (pins 11/12); packed with validationCycles. */
+    uint8_t reserved_padding[2]; /* Explicit padding for 4-byte alignment of lastFirmwareVersion. */
+    uint32_t lastFirmwareVersion;  /* FIRMWARE_VERSION_V330 when saved; mismatch forces validation period. */
 } PersistentData_t;
 
 PersistentData_t persistentData;
@@ -228,6 +216,12 @@ static uint8_t lastTxFPort;
 /** Set true at boot; cleared after first successful batch TX. Flags bit 1 in payload (cold boot/reset). */
 static bool coldBootThisRun = true;
 
+/* Runtime interval/FPort/USB from configureIntervals(persistentData.runMode); set in setup(). */
+static uint32_t currentMeasureInterval = 10800u;   /* seconds; PROD default until configureIntervals runs */
+static uint32_t currentSleepMs = 10800000UL;      /* PROD default */
+static uint8_t currentFPort = FPORT_INTERVAL_3H;  /* PROD default */
+static bool detachUsbBeforeSleep = true;           /* Non-DEV: detach before deepSleep; set in configureIntervals (USB active only in DEV). */
+
 void do_wake(osjob_t* j);  /* measure, append, then backup+send or sleep */
 void do_send(osjob_t* j);
 void do_sleep(osjob_t* j);
@@ -250,9 +244,53 @@ static void save_session_to_flash(bool updateSeqnoFromLmic = true) {
 const lmic_pinmap lmic_pins = {
     .nss = 8,
     .rxtx = LMIC_UNUSED_PIN,
-    .rst = LMIC_UNUSED_PIN,
+    .rst = 4,
     .dio = {3, 6, LMIC_UNUSED_PIN},
 };
+
+/** SAMD21 RCAUSE: mandatory fallback if toolchain does not define. POR = Bit 1 (0x02), EXT = Bit 4 (0x10). */
+#ifndef PM_RCAUSE_POR
+#define PM_RCAUSE_POR 0x02
+#endif
+#ifndef PM_RCAUSE_EXT
+#define PM_RCAUSE_EXT 0x10
+#endif
+
+/** True if MCU started due to power-on (POR) or external reset (RST button). */
+static bool isHardwareReset(void) {
+    uint8_t cause = PM->RCAUSE.reg;
+    return (cause & PM_RCAUSE_POR) || (cause & PM_RCAUSE_EXT);
+}
+
+/** Read pins 11/12 with pull-up, then set INPUT (High-Z) for 0 µA. Call only when version mismatch or isHardwareReset(). */
+static void updateHardwareRunMode(void) {
+    pinMode(STRAP_DEV_PIN, INPUT_PULLUP);
+    pinMode(STRAP_TEST_PIN, INPUT_PULLUP);
+    delay(10);
+    if (digitalRead(STRAP_DEV_PIN) == LOW)
+        persistentData.runMode = RUN_MODE_DEV;
+    else if (digitalRead(STRAP_TEST_PIN) == LOW)
+        persistentData.runMode = RUN_MODE_TEST;
+    else
+        persistentData.runMode = RUN_MODE_PROD;
+    pinMode(STRAP_DEV_PIN, INPUT);
+    pinMode(STRAP_TEST_PIN, INPUT);
+}
+
+/** Set runtime interval, FPort, and USB detach from persisted runMode. Call once in setup() after runMode is stable. USB only active in DEV (strapping). */
+static void configureIntervals(uint8_t mode) {
+    if (mode == RUN_MODE_DEV || mode == RUN_MODE_TEST) {
+        currentMeasureInterval = 300u;
+        currentSleepMs = 300000UL;
+        currentFPort = FPORT_INTERVAL_5MIN;
+        detachUsbBeforeSleep = (mode != RUN_MODE_DEV);  /* USB active only in DEV */
+    } else {
+        currentMeasureInterval = 10800u;
+        currentSleepMs = 10800000UL;
+        currentFPort = FPORT_INTERVAL_3H;
+        detachUsbBeforeSleep = true;
+    }
+}
 
 /** MAC storm fallback: if do_send at 2s did not trigger EV_TXSTART, force sleep to avoid 90s hang. */
 static void mac_retry_fallback(osjob_t* j) {
@@ -376,9 +414,7 @@ void onEvent (ev_t ev) {
             SERIAL_PRINTLN(persistentData.seqnoUp);
             save_session_to_flash();
             /* v3.1: Join-first power isolation. Sensors only after EV_JOINED; no second uplink – FPort 10/20 batch from do_send is the only TX. */
-#if RUN_MODE != RUN_MODE_TEST
-            sensors.begin();
-#endif
+            if (persistentData.runMode != RUN_MODE_TEST) sensors.begin();
             /* Post-join: EV_TXSTART (app watchdog) or EV_TXCOMPLETE will schedule next step; no 90s backstop. */
             break;
         case EV_RFU1:
@@ -406,13 +442,11 @@ void onEvent (ev_t ev) {
         }
         case EV_TXCOMPLETE:
             /* Start DS18B20 conversion so it runs during the 2 s pre-sleep delay (overlap). */
-#if RUN_MODE != RUN_MODE_TEST
-            sensors.setWaitForConversion(false);
-            sensors.requestTemperatures();
-#endif
-#if RUN_MODE == RUN_MODE_DEV
-            blinkLed();   /* send succeeded */
-#endif
+            if (persistentData.runMode != RUN_MODE_TEST) {
+                sensors.setWaitForConversion(false);
+                sensors.requestTemperatures();
+            }
+            if (persistentData.runMode == RUN_MODE_DEV) blinkLed();   /* send succeeded */
             SERIAL_PRINTLN(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
             if (LMIC.txrxFlags & TXRX_ACK) SERIAL_PRINTLN(F("Received ack"));
             if (LMIC.dataLen) {
@@ -578,24 +612,21 @@ void do_send(osjob_t* j) {
     uint8_t paybuf[4 + 2 * LOG_SEND_CAP];
     uint16_t payLen = buildBatchPayload(paybuf, vbatCentivolt, flagsByte, sequenceByte, n, persistentLog.entries);
 
-    uint8_t targetPort = (RUN_MODE == RUN_MODE_PROD) ? FPORT_INTERVAL_3H : FPORT_INTERVAL_5MIN;
     SERIAL_PRINT(F("Sending batch n="));
     SERIAL_PRINT(n);
     SERIAL_PRINT(F(" VBat="));
     SERIAL_PRINTLN((float)vbatCentivolt / 100.0f);
     SERIAL_PRINT(F("[send] LMIC_setTxData2 port="));
-    SERIAL_PRINT(targetPort);
+    SERIAL_PRINT(currentFPort);
     SERIAL_PRINT(F(" len="));
     SERIAL_PRINTLN(payLen);
 
-#if RUN_MODE == RUN_MODE_DEV
-    blinkLed();   /* attempting to send */
-#endif
+    if (persistentData.runMode == RUN_MODE_DEV) blinkLed();   /* attempting to send */
     /* Set lastTxFPort before LMIC_setTxData2 so EV_TXCOMPLETE and app watchdog can identify application TX even if stack delays or merges events. */
-    lastTxFPort = targetPort;
+    lastTxFPort = currentFPort;
     macStormRetryPending = false;   /* MAC storm retry: packet queued, EV_TXSTART will fire */
     /* All uplinks Unconfirmed (4th arg 0) for battery life; no ACK wait/retries. */
-    LMIC_setTxData2(targetPort, paybuf, (uint8_t)payLen, 0);
+    LMIC_setTxData2(currentFPort, paybuf, (uint8_t)payLen, 0);
     SERIAL_PRINTLN(F("[send] Packet queued (batch)"));
 }
 
@@ -634,10 +665,10 @@ void do_wake(osjob_t* j) {
     wakeStartMs = millis();
     SERIAL_PRINTLN(F("[wake] Standby exit @ millis="));
     SERIAL_PRINTLN(millis());
-#if RUN_MODE == RUN_MODE_DEV
-    SERIAL_PRINT(F("[DEV] Wake @ millis="));
-    SERIAL_PRINTLN(millis());
-#endif
+    if (persistentData.runMode == RUN_MODE_DEV) {
+        SERIAL_PRINT(F("[DEV] Wake @ millis="));
+        SERIAL_PRINTLN(millis());
+    }
     SERIAL_PRINTLN(F("[wake] do_wake entry"));
     float vbatV = VBAT_VOLTS();
     setWakeDeadline(!haveStoredSession, vbatV);  /* Zero-Trust awake budget for this wake cycle */
@@ -648,26 +679,25 @@ void do_wake(osjob_t* j) {
         do_send(&sendjob);
         return;
     }
-#if RUN_MODE == RUN_MODE_TEST
-    /* Battery test: skip DS18B20 read to save current. */
-    float tempC = (float)NAN;
-    (void)tempC;
-#else
-    sensors.setWaitForConversion(false);
-    sensors.requestTemperatures();
-    uint32_t startMs = millis();
-    while (!sensors.isConversionComplete() && (millis() - startMs < (uint32_t)DS18B20_READ_TIMEOUT_MS))
-        delay(50);
-    float tempC = (millis() - startMs < (uint32_t)DS18B20_READ_TIMEOUT_MS) ? sensors.getTempCByIndex(0) : (float)NAN;
-#endif
+    float tempC;
+    if (persistentData.runMode == RUN_MODE_TEST) {
+        tempC = (float)NAN;  /* Battery test: skip DS18B20 read to save current. */
+        (void)tempC;
+    } else {
+        sensors.setWaitForConversion(false);
+        sensors.requestTemperatures();
+        uint32_t startMs = millis();
+        while (!sensors.isConversionComplete() && (millis() - startMs < (uint32_t)DS18B20_READ_TIMEOUT_MS))
+            delay(50);
+        tempC = (millis() - startMs < (uint32_t)DS18B20_READ_TIMEOUT_MS) ? sensors.getTempCByIndex(0) : (float)NAN;
+    }
     SERIAL_PRINT(F("[wake] temp="));
     SERIAL_PRINT(tempC);
     AppLogEntry e;
-#if RUN_MODE == RUN_MODE_TEST
-    e.temperature = 0xFFFFu;  /* sentinel: no sensor read in battery test */
-#else
-    e.temperature = encodeTemperatureHighRes(tempC);
-#endif
+    if (persistentData.runMode == RUN_MODE_TEST)
+        e.temperature = 0xFFFFu;  /* sentinel: no sensor read in battery test */
+    else
+        e.temperature = encodeTemperatureHighRes(tempC);
 
     /* Recent-first: new reading at index 0; shift existing right so decoder sees newest first (anchor - i*interval). */
     if (ramCount > LOG_ENTRIES_MAX) ramCount = LOG_ENTRIES_MAX;  /* defensive cap */
@@ -712,19 +742,6 @@ void do_wake(osjob_t* j) {
     }
 }
 
-// STANDBY sleep via Arduino Low Power. Delta sleep keeps period accurate (interval - awake). do_sleep does not wait for radio idle (proactive hand-off).
-// Detach USB before deep sleep so sleep current is ~5–15 µA; otherwise Feather M0 USB draws ~10 mA. Default: 1 in PROD, 0 in DEV/TEST (Serial debugging).
-#ifndef DETACH_USB_BEFORE_SLEEP
-#if RUN_MODE == RUN_MODE_PROD
-#define DETACH_USB_BEFORE_SLEEP 1
-#else
-#define DETACH_USB_BEFORE_SLEEP 0
-#endif
-#endif
-#if DETACH_USB_BEFORE_SLEEP
-#include <USB/USBDevice.h>
-#endif
-
 /* do_sleep: proactive hand-off; no wait for radio idle. Session persisted here only when seqnoUp increased (see guard below); otherwise EV_TXCOMPLETE or watchdog path persists. */
 void do_sleep(osjob_t* j) {
     (void)j;
@@ -756,8 +773,8 @@ void do_sleep(osjob_t* j) {
         delay(10);  /* allow any prior NVM write to complete before deep sleep (SAMD21) */
 
     float vbatV = VBAT_VOLTS();
-    /* Critical: 600 s; low: double interval; hibernation: 1 h. Normal: delta sleep to keep period accurate (interval - awake). */
-    uint32_t intervalMs = (RUN_MODE == RUN_MODE_PROD) ? (INTERVAL_SEC_PROD * 1000UL) : (INTERVAL_SEC_DEV_TEST * 1000UL);
+    /* Critical: 600 s; low: double interval with delta-sleep; hibernation: 1 h. Normal: delta sleep (interval - awake). */
+    uint32_t intervalMs = currentMeasureInterval * 1000UL;
     uint32_t effectiveSleepMs;
     if (hibernationRequested) {
         effectiveSleepMs = 3600000UL;  /* 1 h */
@@ -766,7 +783,9 @@ void do_sleep(osjob_t* j) {
     } else if (vbatV < VBAT_CRITICAL_THRESHOLD_V) {
         effectiveSleepMs = 600000UL;  /* 10 min */
     } else if (vbatV < VBAT_LOW_THRESHOLD_V) {
-        effectiveSleepMs = (uint32_t)SLEEP_SECONDS * 2000UL;
+        uint32_t lowVbatIntervalMs = intervalMs * 2;
+        uint32_t awakeDurationMs = (uint32_t)(millis() - wakeStartMs);
+        effectiveSleepMs = (awakeDurationMs < lowVbatIntervalMs) ? (lowVbatIntervalMs - awakeDurationMs) : 1000UL;
     } else if (afterWatchdog) {
         effectiveSleepMs = intervalMs;  /* fixed recovery; wakeStartMs is from previous do_wake and is stale */
     } else {
@@ -787,30 +806,15 @@ void do_sleep(osjob_t* j) {
         while (elapsed < effectiveSleepMs) {
             uint32_t step = (effectiveSleepMs - elapsed >= chunkMs) ? chunkMs : (effectiveSleepMs - elapsed);
             delay(step);
-            if (Serial) Serial.flush();
+            if (persistentData.runMode == RUN_MODE_DEV && Serial) Serial.flush();
             elapsed += step;
         }
         do_wake(&sendjob);
         return;  /* CRITICAL: Exit so standard sleep path (DEV wait / deepSleep) is never reached. */
     }
 
-    /* Defensive: never use standard sleep path when unjoined (v3.2 commissioning priority). */
-    if (!haveStoredSession) {
-        SERIAL_PRINTLN(F("[valid] Bench Mode Guard: no session, using delay()"));
-        uint32_t elapsed = 0u;
-        const uint32_t chunkMs = 5000u;
-        while (elapsed < effectiveSleepMs) {
-            uint32_t step = (effectiveSleepMs - elapsed >= chunkMs) ? chunkMs : (effectiveSleepMs - elapsed);
-            delay(step);
-            if (Serial) Serial.flush();
-            elapsed += step;
-        }
-        do_wake(&sendjob);
-        return;
-    }
-
-    /* Standard sleep logic runs only when stayAwake is false and session exists. */
-#if RUN_MODE == RUN_MODE_DEV
+    /* Standard sleep logic runs only when stayAwake is false (haveStoredSession && validationCycles >= 2). */
+    if (persistentData.runMode == RUN_MODE_DEV) {
     SERIAL_PRINT(F("[DEV] Entering sleep wait — "));
     SERIAL_PRINT(effectiveSleepMs / 1000UL);
     SERIAL_PRINT(F(" s @ millis="));
@@ -831,29 +835,21 @@ void do_sleep(osjob_t* j) {
     }
     SERIAL_PRINT(F("[DEV] Sleep wait over — waking @ millis="));
     SERIAL_PRINTLN(millis());
-#else
-    /* Radio DIO pins (3, 6): LMIC remains idle after reset/sleep; no explicit detach before deepSleep. */
-#if DETACH_USB_BEFORE_SLEEP
-    USBDevice.detach();
+    } else {
+    /* Radio DIO pins (3, 6): LMIC remains idle after reset/sleep. Runtime USB detach for PROD. */
+#if HAVE_USB_DEVICE
+    if (detachUsbBeforeSleep) USBDevice.detach();
 #endif
     LowPower.deepSleep(effectiveSleepMs);
-#if DETACH_USB_BEFORE_SLEEP
-    USBDevice.attach();
+#if HAVE_USB_DEVICE
+    if (detachUsbBeforeSleep) USBDevice.attach();
 #endif
-#endif
+    }
     do_wake(&sendjob);
 }
 
 
 void setup() {
-#if RUN_MODE == RUN_MODE_DEV
-    /* Upload window: 10 s for firmware upload before deep sleep (M0 has no boot selector). */
-    delay(10000);
-#endif
-    SERIAL_BEGIN(9600);
-#if RUN_MODE == RUN_MODE_DEV
-    delay(2000);  /* allow serial monitor to connect */
-#endif
 #if defined(__SAMD21__)
     /* BOD33 at 2.7V for clean shutdown during LoRa TX surge (120 mA); avoids flash corruption. */
     {
@@ -865,15 +861,38 @@ void setup() {
         SYSCTRL_BOD33_REG = (32u << 16) | (2u << 3) | 1u;  /* LEVEL 32 ~2.7V, ACTION reset, ENABLE */
     }
 #endif
+    persistentStore.read(&persistentData);
+    bool versionMismatch = (persistentData.lastFirmwareVersion != FIRMWARE_VERSION_V330);
+    bool hardwareReset = isHardwareReset();
+    if (versionMismatch || hardwareReset) {
+        if (versionMismatch) {
+            persistentData.runMode = RUN_MODE_PROD;
+            updateHardwareRunMode();
+            persistentData.lastFirmwareVersion = FIRMWARE_VERSION_V330;
+            persistentData.validationCycles = 0;
+        } else {
+            updateHardwareRunMode();
+        }
+        persistentStore.write(persistentData);
+        delay(20);
+    }
+    configureIntervals(persistentData.runMode);
+#if HAVE_USB_DEVICE
+    /* TEST and PROD: never initialize or use USB; detach immediately so Serial is never started. */
+    if (persistentData.runMode != RUN_MODE_DEV) USBDevice.detach();
+#endif
+    if (persistentData.runMode == RUN_MODE_DEV) {
+        delay(10000);
+        Serial.begin(9600);
+        delay(2000);
+    }
     SERIAL_PRINTLN(F("Starting"));
     SERIAL_PRINT(F("Starting VBat="));
     SERIAL_PRINTLN(VBAT_VOLTS());
     lastTxFPort = 0;
-    coldBootThisRun = true;  /* First send after boot sets payload flags bit1 (cold boot); cleared after first batch TX. */
+    coldBootThisRun = true;
     SERIAL_PRINT(F("[setup] sizeof(AppLogEntry)="));
     SERIAL_PRINTLN((unsigned)sizeof(AppLogEntry));
-    SERIAL_PRINTLN(F("[setup] persistentStore.read"));
-    persistentStore.read(&persistentData);
     SERIAL_PRINT(F("[setup] seqnoUp from flash: "));
     SERIAL_PRINTLN(persistentData.seqnoUp);
     SERIAL_PRINT(F("[setup] magic=0x"));
@@ -882,13 +901,8 @@ void setup() {
     SERIAL_PRINT(persistentData.devaddr, HEX);
     SERIAL_PRINT(F(" seqnoUp="));
     SERIAL_PRINTLN(persistentData.seqnoUp);
-    /* Accept PERSIST_MAGIC (legacy) or PERSIST_MAGIC_V2. Do not check devEuiTag: with cmaglie FlashStorage
-     * and extended PersistentData_t, the last 8 bytes may read from the next slot (logStore), so devEuiTag
-     * can be wrong and would reject a valid session; accept any V2 to avoid join loop. */
-    haveStoredSession = (persistentData.magic == PERSIST_MAGIC) || (persistentData.magic == PERSIST_MAGIC_V2);
-    if (haveStoredSession && persistentData.devaddr == 0u) {
-        haveStoredSession = false;  /* Invalid session (DevAddr 0); force new join. */
-    }
+    /* Session restore: only V2 magic and non-zero DevAddr. */
+    haveStoredSession = (persistentData.magic == PERSIST_MAGIC_V2) && (persistentData.devaddr != 0u);
     SERIAL_PRINT(F("[setup] haveStoredSession="));
     SERIAL_PRINTLN(haveStoredSession ? 1 : 0);
     if (!haveStoredSession) {
@@ -896,11 +910,6 @@ void setup() {
         persistentData.measuresInPeriod = 0;
     } else {
         persistentData.measuresInPeriod = persistentData.measuresInPeriod % SEND_PERIOD_MEASURES;
-    }
-    /* v3.2 Join-Persistence Integrity: force validation on first boot after flash or firmware version change. */
-    if (persistentData.lastFirmwareVersion != FIRMWARE_VERSION_V32) {
-        persistentData.validationCycles = 0;
-        persistentData.lastFirmwareVersion = FIRMWARE_VERSION_V32;
     }
     if (!haveStoredSession)
         persistentData.validationCycles = 0;
@@ -936,12 +945,8 @@ void setup() {
     SERIAL_PRINTLN(F("[setup] pinMode do_wake"));
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, LOW);   /* DEV: blink on send; TEST/PROD: off */
-    /* Join-first power isolation: sensors.begin() only after EV_JOINED or when restoring session so data path has sensor. */
-    if (haveStoredSession) {
-#if RUN_MODE != RUN_MODE_TEST
+    if (haveStoredSession && persistentData.runMode != RUN_MODE_TEST)
         sensors.begin();
-#endif
-    }
     ramCount = 0;
     setWakeDeadline(!haveStoredSession, VBAT_VOLTS());
     do_wake(&sendjob);
@@ -960,9 +965,7 @@ void loop() {
             }
         }
         SERIAL_PRINTLN(F("[watchdog] AWAKE LIMIT REACHED. Forcing sleep."));
-#if RUN_MODE == RUN_MODE_DEV
-        if (Serial) Serial.flush();
-#endif
+        if (persistentData.runMode == RUN_MODE_DEV && Serial) Serial.flush();
         /* Session/wakeCounter persisted in do_sleep with save_session_to_flash(false) to avoid overwriting seqnoUp after LMIC_reset. */
         macStormRetryPending = false;  /* Avoid stale mac_retry_fallback firing after wake */
         consecutivePort0Downlinks = 0;
@@ -970,12 +973,10 @@ void loop() {
         LMIC.opmode = 0;  /* Clear opmode so next wake starts clean. */
         LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);  /* 20% for Feather M0 / RX2 window */
         APP_DISABLE_LMIC_DUTY_CYCLE();
-#if RUN_MODE == RUN_MODE_DEV
-        if (hibernationRequested) {
+        if (persistentData.runMode == RUN_MODE_DEV && hibernationRequested) {
             if (Serial) Serial.flush();
             delay(100);
         }
-#endif
         os_setTimedCallback(&sendjob, os_getTime(), do_sleep);
         wakeDeadlineMs = millis() + 60000;  /* prevent re-trigger until do_sleep runs */
     }
