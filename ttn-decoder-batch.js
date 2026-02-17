@@ -1,6 +1,6 @@
 /**
  * TTN / The Things Stack custom payload decoder for M0 batched log uplinks.
- * v3.0 Timeless: FPort 10 = 300 s, FPort 20 = 10800 s. 4-byte header [vbat(2), flags(1), sequence(1)] + 2×n. Time from gateway received_at; entry i = anchor - i*interval.
+ * v3.1 Timeless: FPort 10 = 300 s, FPort 20 = 10800 s. 4-byte header [vbat(2), flags(1), sequence(1)] + 2×n. Time from gateway received_at; entry i = anchor - i*interval.
  * FPort 2: HELLO WORLD. FPort 4: legacy 3-byte time request. FPort 1: legacy v2.8 batch (7-byte header + baseTick).
  *
  * In Console → Application → Payload Formats → Custom: paste this as decoder.
@@ -16,7 +16,7 @@ function decodeUplink(input) {
     return { data: { message: text } };
   }
 
-  // v3.0 Timeless: FPort 10 (300 s) or FPort 20 (10800 s), 4-byte header + 2×n entries, newest first
+  // v3.1 Timeless: FPort 10 (300 s) or FPort 20 (10800 s), 4-byte header + 2×n entries, newest first
   if ((input.fPort === 10 || input.fPort === 20) && b.length >= 4) {
     var interval = (input.fPort === 20) ? 10800 : 300;
     var battery_v = (((b[0] << 8) | b[1]) >>> 0) / 100;

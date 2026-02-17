@@ -1,4 +1,4 @@
-/* Log entry type: defined before any #include so no library (e.g. LMIC) macro can shadow AppLogEntry. v3.0: 2-byte entry; time from gateway received_at − entry index × interval (FPort). */
+/* Log entry type: defined before any #include so no library (e.g. LMIC) macro can shadow AppLogEntry. v3.1: 2-byte entry; time from gateway received_at − entry index × interval (FPort). */
 struct LogEntryS {
     uint16_t temperature;
 } __attribute__((packed));
@@ -10,7 +10,7 @@ typedef struct LogEntryS AppLogEntry;
 /* No-op when LMIC does not provide LMIC_disableDutyCycle. To enable duty-cycle bypass, use a library that provides it and replace with LMIC_disableDutyCycle(). */
 #define APP_DISABLE_LMIC_DUTY_CYCLE() ((void)0)
 
-/* Firmware v3.0 – Timeless Resilience: No RTC; time from gateway received_at. FPort 10 = 300 s, FPort 20 = 10800 s. 4-byte header (vbat, flags, sequence). Join-first; 90 s join budget; 1 h hibernation after 3× join watchdog. Zero-Trust watchdog: 30 s (or 90 s join / 15 s low VBat) awake budget; delta sleep. */
+/* Firmware v3.1 – Clean-Join: no post-join HELLO; single FPort 10/20 batch after join then sleep. Timeless: time from gateway received_at. FPort 10 = 300 s, FPort 20 = 10800 s. 4-byte header (vbat, flags, sequence). Join-first; 90 s join budget; delta sleep. */
 
 /*******************************************************************************
  * Copyright (c) 2015 Thomas Telkamp and Matthijs Kooijman
@@ -43,8 +43,8 @@ typedef struct LogEntryS AppLogEntry;
  *
  * Set region and radio in the MCCI LMIC library: lmic_project_config.h (CFG_eu868, CFG_sx1276_radio).
  *
- * Batched log (c) 2026 by the_louie, v3.0 Timeless:
- *  - On each wake: measure, append to RAM (newest at index 0); on send wake merge RAM to Flash, uplink on FPort 10 (300 s) or 20 (10800 s); on success clear Flash.
+ * Batched log (c) 2026 by the_louie, v3.1 Clean-Join:
+ *  - On each wake: measure, append to RAM (newest at index 0); on send wake merge RAM to Flash, uplink on FPort 10 (300 s) or 20 (10800 s); on success clear Flash. After join, only this batch is sent (no post-join HELLO).
  *  - Payload: 4-byte header [vbat×100][flags][sequence] then 2×n temperature. Flags bit0 = watchdog, bit1 = cold boot. Time from gateway received_at; decoder uses FPort for interval.
  *  - Session saved on join, restored on wake.
  *
@@ -57,7 +57,7 @@ typedef struct LogEntryS AppLogEntry;
  * "Uplink dropped" = frame counter. (2) Confirm DIO1 (RFM95) to pin 6 (M0); without it no RX.
  * (3) Device very close to gateway (under 3 m) can desensitize; try another room. (4) SPI
  * shared (Flash + LoRa). (5) Brown-out during TX (120 mA) can corrupt RFM95; supply decoupling.
- * Runbook: DETACH_USB_BEFORE_SLEEP (PROD default) for ~5–15 µA sleep; DS18B20 4.7 kΩ pull-up; sensor read timeout 2 s; Starting logs VBat; below 3.4 V sleep doubled, below 3.2 V critical (skip TX, 600 s sleep). BOD33 2.7V. Ensure 1000µF capacitor on supply to prevent false resets during SF7 TX spike. Payload 4+2×43 bytes max (v3.0). SF bump: 3× link dead → SF8 one cycle. Cold Boot test: pull battery, reattach; verify device joins at SF7 and resumes correct seqnoUp from flash (no drift); after 3× EV_LINK_DEAD next cycle may use SF8.
+ * Runbook: DETACH_USB_BEFORE_SLEEP (PROD default) for ~5–15 µA sleep; DS18B20 4.7 kΩ pull-up; sensor read timeout 2 s; Starting logs VBat; below 3.4 V sleep doubled, below 3.2 V critical (skip TX, 600 s sleep). BOD33 2.7V. Ensure 1000µF capacitor on supply to prevent false resets during SF7 TX spike. Payload 4+2×43 bytes max (v3.1). SF bump: 3× link dead → SF8 one cycle. Cold Boot test: pull battery, reattach; verify device joins at SF7 and resumes correct seqnoUp from flash (no drift); after 3× EV_LINK_DEAD next cycle may use SF8.
  *******************************************************************************/
 
 #include <hal/hal.h>
@@ -211,13 +211,10 @@ static void setWakeDeadline(bool isJoinPhase, float vbatV) {
     wakeDeadlineMs = millis() + ms;
 }
 
-/** FPort of last application TX (batch=10/20, post_join_first_uplink=2). MAC-only (Port 0) completions do not set this; we only persist to flash when lastTxFPort > 0. */
+/** FPort of last application TX (batch=10/20). MAC-only (Port 0) completions do not set this; we only persist to flash when lastTxFPort > 0. */
 static uint8_t lastTxFPort;
 /** Set true at boot; cleared after first successful batch TX. Flags bit 1 in payload (cold boot/reset). */
 static bool coldBootThisRun = true;
-
-/** One-shot: queue HELLO WORLD on FPort 2 after join. TTN: allow NS to finalize session before first data. */
-static void post_join_first_uplink(osjob_t* j);
 
 void do_wake(osjob_t* j);  /* measure, append, then backup+send or sleep */
 void do_send(osjob_t* j);
@@ -295,7 +292,7 @@ void onEvent (ev_t ev) {
         case EV_JOINED:
             SERIAL_PRINTLN(F("EV_JOINED"));
             consecutiveJoinFailCount = 0;  /* Success resets join backoff. */
-            lastTxFPort = 0;
+            /* Do not set lastTxFPort = 0: do_send already set it for the queued batch; EV_TXCOMPLETE must see it to persist and clear log. */
             consecutivePort0Downlinks = 0;  /* Fresh join; clear MAC Port 0 counter. */
             LMIC_setLinkCheckMode(1);
             LMIC_setAdrMode(0);   /* ADR off in all run modes: no SF drift to SF12, multi-year battery */
@@ -314,12 +311,10 @@ void onEvent (ev_t ev) {
             SERIAL_PRINT(F(" SeqNo="));
             SERIAL_PRINTLN(persistentData.seqnoUp);
             save_session_to_flash();
-            /* Join-first power isolation: sensors.begin() only after EV_JOINED so OneWire/Pin 5 stay inert during join. */
+            /* v3.1: Join-first power isolation. Sensors only after EV_JOINED; no second uplink – FPort 10/20 batch from do_send is the only TX. */
 #if RUN_MODE != RUN_MODE_TEST
             sensors.begin();
 #endif
-            /* Delay first uplink so TTN NS can finalize session (3–5 s). */
-            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(5), post_join_first_uplink);
             break;
         case EV_RFU1:
             SERIAL_PRINTLN(F("EV_RFU1"));
@@ -431,17 +426,6 @@ void onEvent (ev_t ev) {
     }
 }
 
-static void post_join_first_uplink(osjob_t* j) {
-    (void)j;
-#if RUN_MODE == RUN_MODE_DEV
-    blinkLed();
-#endif
-    uint8_t helloPayload[] = "HELLO WORLD";
-    lastTxFPort = 2;
-    LMIC_setTxData2(2, helloPayload, (u1_t)(sizeof(helloPayload) - 1u), 0);
-    SERIAL_PRINTLN(F("HELLO WORLD uplink queued on FPort 2 (post-join)"));
-}
-
 /** Encode temperature °C as 2-byte value: 0-3000 = centidegrees (0.00-30.00°C), 0xFFFD=>30, 0xFFFE=<0, 0xFFFF=error. */
 static uint16_t encodeTemperatureHighRes(float tempC) {
     if (tempC < -50.0f || tempC != tempC) return 0xFFFFu;
@@ -453,7 +437,7 @@ static uint16_t encodeTemperatureHighRes(float tempC) {
     return (uint16_t)v;
 }
 
-/** v3.0 payload: 4-byte header [VBat_Hi,VBat_Lo][Flags][Sequence] then 2×n temp. Flags: bit0=watchdog, bit1=cold boot. Sequence = wakeCounter & 0xFF for gap detection. */
+/** v3.1 payload: 4-byte header [VBat_Hi,VBat_Lo][Flags][Sequence] then 2×n temp. Flags: bit0=watchdog, bit1=cold boot. Sequence = wakeCounter & 0xFF for gap detection. */
 static uint16_t buildBatchPayload(uint8_t* buf, uint16_t vbatCentivolt, uint8_t flagsByte, uint8_t sequenceByte, uint8_t n, const AppLogEntry* entries) {
     uint16_t i = 0;
     buf[i++] = (uint8_t)(vbatCentivolt >> 8);
