@@ -10,7 +10,7 @@ typedef struct LogEntryS AppLogEntry;
 /* No-op when LMIC does not provide LMIC_disableDutyCycle. To enable duty-cycle bypass, use a library that provides it and replace with LMIC_disableDutyCycle(). */
 #define APP_DISABLE_LMIC_DUTY_CYCLE() ((void)0)
 
-/* Firmware v2.6 – Proactive Sleep & Implicit Timestamping. Duty cycle disabled, SF7 default; failure-based SF bump. */
+/* Firmware v2.8 – Industrial Resilience: Join-First gate (no sensor/merge until session); 90 s join budget; 1-hour hibernation after 3× join watchdog; time gating (FPort 4 and 3-byte until RTC synced); MAC reset on EV_JOINED; optional 1000µF capacitor. Zero-Trust watchdog: 30 s (or 90 s join / 15 s low VBat) awake budget; conditional save_session in watchdog; rollover-safe millis(). */
 
 /*******************************************************************************
  * Copyright (c) 2015 Thomas Telkamp and Matthijs Kooijman
@@ -45,11 +45,11 @@ typedef struct LogEntryS AppLogEntry;
  *
  * Batched log (c) 2026 by the_louie:
  *  - measure every 5 min (DEV, TEST, PROD), append log entry (temperature; time implicit from baseTick at send) to RAM; on send wake merge RAM to Flash, attempt uplink; on success clear Flash, on failure keep Flash and retry next send wake.
- *  - Payload (v2.6): [vbat×100][n][baseTick_3B][temperature_2B × n] big-endian; baseTick = 1-min since epoch, entry i at baseTick+i×5 min; temperature = centidegrees 0-3000 or sentinels (~92 bytes max).
+ *  - Payload: FPort 1 = batch [vbat×100][flags][n][baseTick_3B][temperature_2B × n] (v2.7 7-byte header); FPort 4 = 3-byte time request [vbat_hi,vbat_lo,0x00] when RTC not yet synced (~93 bytes max batch). Optional later: FPort 5 = v2.8 format (decoder branches on fPort).
  *  - RTC keeps time across sleep; epoch persisted in flash. RTC synced via DeviceTimeReq (first after EV_JOINED, ≤1/24 h).
  *  - Session saved on join, restored on wake.
  *
- * TTN / LMIC behaviour: Duty cycle disabled (LMIC_disableDutyCycle); 5-min sleep cycle enforces EU868.
+ * TTN / LMIC behaviour: Duty cycle disabled; 5-min sleep cycle enforces EU868. Zero-Trust watchdog: if awake exceeds budget (30 s data / 90 s join / 15 s low VBat), force LMIC_reset and do_sleep; optional Watchdog Bit in payload (flags bit0) for TTN visibility.
  * SF7 default, ADR off. After 3 consecutive EV_LINK_DEAD the device uses SF8 for one send cycle then reverts to SF7. All uplinks Unconfirmed (no ACK/retries).
  * 15% clock error after every LMIC_reset (crystal drift / long sleep RX windows). SeqNo persisted in EV_TXCOMPLETE
  * only when completed TX was application data (FPort > 0); MAC-only completions skip flash. do_sleep does not wait for radio idle (proactive hand-off); session saved when send cycle complete. MAC throttle: >3 consecutive Port 0 downlinks trigger LMIC reset and duty-cycle disable. Link Check on after join. EV_LINK_DEAD triggers LMIC_reset and re-join. do_send allows at most one 10 s reschedule when OP_TXRXPEND; on second blocked attempt forces sleep. RX2 from Join Accept.
@@ -58,7 +58,7 @@ typedef struct LogEntryS AppLogEntry;
  * "Uplink dropped" = frame counter. (2) Confirm DIO1 (RFM95) to pin 6 (M0); without it no RX.
  * (3) Device very close to gateway (under 3 m) can desensitize; try another room. (4) SPI
  * shared (Flash + LoRa). (5) Brown-out during TX (120 mA) can corrupt RFM95; supply decoupling.
- * Runbook: DETACH_USB_BEFORE_SLEEP (PROD default) for ~5–15 µA sleep; DS18B20 4.7 kΩ pull-up; sensor read timeout 2 s; Starting logs VBat; below 3.4 V sleep doubled, below 3.2 V critical (skip TX, 600 s sleep). BOD33 2.7V. Payload ~92 bytes max. SF bump: 3× link dead → SF8 one cycle. Cold Boot test: pull battery, reattach; verify device joins at SF7 and resumes correct seqnoUp from flash (no drift); after 3× EV_LINK_DEAD next cycle may use SF8.
+ * Runbook: DETACH_USB_BEFORE_SLEEP (PROD default) for ~5–15 µA sleep; DS18B20 4.7 kΩ pull-up; sensor read timeout 2 s; Starting logs VBat; below 3.4 V sleep doubled, below 3.2 V critical (skip TX, 600 s sleep). BOD33 2.7V. Ensure 1000µF capacitor on supply to prevent false resets during SF7 TX spike. Payload ~93 bytes max (v2.8 batch 7-byte header +flags). SF bump: 3× link dead → SF8 one cycle. Cold Boot test: pull battery, reattach; verify device joins at SF7 and resumes correct seqnoUp from flash (no drift); after 3× EV_LINK_DEAD next cycle may use SF8.
  *******************************************************************************/
 
 #include <hal/hal.h>
@@ -217,6 +217,24 @@ static bool useSf8NextCycle = false;
 static uint8_t consecutivePort0Downlinks = 0;
 static bool skipPersistDueToMacStorm = false;
 
+/** Zero-Trust watchdog: MCU forces sleep when millis() exceeds this deadline regardless of radio state. */
+#define MAX_AWAKE_TIME_MS      30000   /* 30 s for data uplinks */
+#define MAX_AWAKE_JOIN_MS     90000   /* 90 s for OTAA join (handshake can exceed 60 s in poor conditions) */
+#define MAX_AWAKE_LOW_VBAT_MS 15000   /* 15 s when VBat < 3.4 V */
+static uint32_t wakeDeadlineMs = 0;
+/** Set when watchdog forces sleep; included in next batch payload (flags byte bit0), then cleared. */
+static bool watchdogTriggeredLastWake = false;
+/** Join failure backoff: after 3 consecutive watchdog triggers during join, one 1-hour hibernation. */
+static uint8_t consecutiveWatchdogTriggers = 0;
+static bool hibernationRequested = false;
+
+/** Set wake deadline for this wake cycle (join vs data, VBat-aware). Zero-Trust awake budget. */
+static void setWakeDeadline(bool isJoinPhase, float vbatV) {
+    uint32_t ms = (vbatV < VBAT_LOW_THRESHOLD_V) ? MAX_AWAKE_LOW_VBAT_MS
+                  : (isJoinPhase ? MAX_AWAKE_JOIN_MS : MAX_AWAKE_TIME_MS);
+    wakeDeadlineMs = millis() + ms;
+}
+
 /** FPort of last application TX (do_send=1, post_join_first_uplink=2). MAC-only (Port 0) completions do not set this; we only persist to flash when lastTxFPort > 0. */
 static uint8_t lastTxFPort;
 
@@ -227,7 +245,7 @@ void do_wake(osjob_t* j);  /* measure, append, then backup+send or sleep */
 void do_send(osjob_t* j);
 void do_sleep(osjob_t* j);
 
-/** Commit session to flash. Call sites: EV_JOINED; EV_TXCOMPLETE only when last TX was application (lastTxFPort > 0); do_sleep when measuresInPeriod==0 && haveStoredSession && !skipPersist (skipPersist set after MAC storm throttle). Reads LMIC/rtc at call time. */
+/** Commit session to flash. Call sites: EV_JOINED; EV_TXCOMPLETE when last TX was application (lastTxFPort > 0); do_sleep when measuresInPeriod==0 && haveStoredSession && !skipPersist && seqnoUp increased (LMIC.seqnoUp > persistentData.seqnoUp; avoids redundant write and overwrite after watchdog reset). Reads LMIC/rtc at call time. */
 static void save_session_to_flash(void) {
     if (!haveStoredSession) return;
     persistentData.magic = PERSIST_MAGIC_V2;
@@ -259,6 +277,7 @@ static void userNetworkTimeCallback(void *pUserData, int flagSuccess) {
         SERIAL_PRINTLN(F("Network time reference unavailable"));
         return;
     }
+    uint32_t prevSync = persistentData.lastTimeSyncEpoch;
     /* tNetwork is GPS seconds since 1980-01-06; convert to Unix epoch. */
     uint32_t unixEpoch = (uint32_t)lmicTimeRef.tNetwork + GPS_TO_UNIX_EPOCH_OFFSET;
     rtc.setEpoch((time_t)unixEpoch);
@@ -269,6 +288,9 @@ static void userNetworkTimeCallback(void *pUserData, int flagSuccess) {
     /* RAM only; session committed to flash at send cycle or after join via save_session_to_flash(). */
     SERIAL_PRINT(F("RTC synced to epoch: "));
     SERIAL_PRINTLN(unixEpoch);
+    /* Catch-up: first successful time sync with pending RAM data triggers send in 10 s. */
+    if ((prevSync == 0u || prevSync == 0xFFFFFFFFu) && ramCount > 0u)
+        os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(10), do_send);
 }
 
 /** Classify downlink: dataLen==0 = Port 0 (MAC-only); dataLen>0 then FPort from LMIC.frame[LMIC.dataBeg-1]. Update consecutivePort0Downlinks; if > threshold, LMIC_reset + disableDutyCycle + session restore + schedule do_send, return true. */
@@ -324,6 +346,7 @@ void onEvent (ev_t ev) {
         case EV_JOINED:
             SERIAL_PRINTLN(F("EV_JOINED"));
             lastTxFPort = 0;
+            consecutivePort0Downlinks = 0;  /* Fresh join; clear MAC Port 0 counter. */
             LMIC_setLinkCheckMode(1);
             LMIC_setAdrMode(0);   /* ADR off in all run modes: no SF drift to SF12, multi-year battery */
             LMIC_setDrTxpow(5, 14);  /* SF7 (EU868 DR5), 14 dBm: shortest ToA (~56 ms) */
@@ -342,6 +365,7 @@ void onEvent (ev_t ev) {
             SERIAL_PRINTLN(persistentData.seqnoUp);
             save_session_to_flash();
             LMIC_requestNetworkTime(userNetworkTimeCallback, NULL);
+            /* Join-First power isolation: enable sensor power only after successful join (if using a power pin for DS18B20). */
             /* Delay first uplink so TTN NS can finalize session (3–5 s). */
             os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(5), post_join_first_uplink);
             break;
@@ -472,11 +496,14 @@ static uint16_t encodeTemperatureHighRes(float tempC) {
     return (uint16_t)v;
 }
 
-/** Build batched payload (v2.6 implicit time): [vbat_hi,vbat_lo][n][baseTick_hi,baseTick_mid,baseTick_lo][temp_hi,temp_lo] × n, big-endian. Max 6+2*LOG_SEND_CAP bytes (~92). */
+/** Build batched payload (v2.7): [vbat_hi,vbat_lo][flags][n][baseTick_3B][temp_hi,temp_lo]×n. flags bit0 = watchdog triggered. Max 7+2*LOG_SEND_CAP. */
 static uint16_t buildBatchPayload(uint8_t* buf, uint16_t vbatCentivolt, uint8_t n, const AppLogEntry* entries, uint32_t baseTick) {
     uint16_t i = 0;
     buf[i++] = (uint8_t)(vbatCentivolt >> 8);
     buf[i++] = (uint8_t)(vbatCentivolt & 0xFF);
+    uint8_t flags = watchdogTriggeredLastWake ? 1u : 0u;
+    if (watchdogTriggeredLastWake) watchdogTriggeredLastWake = false;
+    buf[i++] = flags;
     buf[i++] = n;
     baseTick &= 0xFFFFFFu;
     buf[i++] = (uint8_t)(baseTick >> 16);
@@ -513,14 +540,30 @@ void do_send(osjob_t* j) {
     } else {
         LMIC_setDrTxpow(SF7_DR_EU868, 14);
     }
+
+    uint32_t lastSync = persistentData.lastTimeSyncEpoch;
+    uint16_t vbatCentivolt = (uint16_t)(VBAT_VOLTS() * 100.0f);
+    /* Time gating: when RTC has never been synced, send only 3-byte time request on FPort 4; do not build batch. */
+    if (lastSync == 0u || lastSync == 0xFFFFFFFFu) {
+        LMIC_requestNetworkTime(userNetworkTimeCallback, NULL);
+        uint8_t paybuf[3];
+        paybuf[0] = (uint8_t)(vbatCentivolt >> 8);
+        paybuf[1] = (uint8_t)(vbatCentivolt & 0xFF);
+        paybuf[2] = 0x00;
+        lastTxFPort = 0;
+        LMIC_setTxData2(4, paybuf, 3, 0);
+        SERIAL_PRINTLN(F("[send] Time request (FPort 4, 3 bytes), no batch"));
+        return;
+    }
+
     /* 5-min cycle (DEV, TEST, PROD) keeps EU868 duty within limits. */
     /* Request network time at most once per 24 h (TTN fair use). First uplink after join already requested in EV_JOINED. */
     uint32_t nowEpoch = (uint32_t)rtc.getEpoch();
-    uint32_t lastSync = persistentData.lastTimeSyncEpoch;
-    if (lastSync == 0 || lastSync == 0xFFFFFFFFu || nowEpoch >= lastSync + NETWORK_TIME_REQUEST_INTERVAL_SEC)
+    if (nowEpoch >= lastSync + NETWORK_TIME_REQUEST_INTERVAL_SEC)
         LMIC_requestNetworkTime(userNetworkTimeCallback, NULL);
 
-    uint16_t vbatCentivolt = (uint16_t)(VBAT_VOLTS() * 100.0f);
+    /* When catch-up from time sync: merge RAM into Flash so batch includes backlog; normal path already merged in do_wake. */
+    if (ramCount > 0u) mergeBackupAndPrepareSend();
     uint8_t n = (persistentLog.count <= LOG_SEND_CAP) ? persistentLog.count : (uint8_t)LOG_SEND_CAP;
     uint32_t nowEpochForTicks = (uint32_t)rtc.getEpoch();
     uint32_t tForTicks = (nowEpochForTicks < CUSTOM_EPOCH) ? CUSTOM_EPOCH : nowEpochForTicks;
@@ -529,7 +572,7 @@ void do_send(osjob_t* j) {
     uint32_t offsetMin = (n > 0) ? ((uint32_t)(n - 1) * 5u) : 0u;
     uint32_t baseTick = (n > 0 && currentTicks <= 0xFFFFFFu && currentTicks >= offsetMin) ? (currentTicks - offsetMin) : 0u;
     baseTick &= 0xFFFFFFu;
-    uint8_t paybuf[6 + 2 * LOG_SEND_CAP];
+    uint8_t paybuf[7 + 2 * LOG_SEND_CAP];
     uint16_t payLen = buildBatchPayload(paybuf, vbatCentivolt, n, persistentLog.entries, baseTick);
 
     SERIAL_PRINT(F("Sending batch n="));
@@ -585,6 +628,14 @@ void do_wake(osjob_t* j) {
     SERIAL_PRINTLN(millis());
 #endif
     SERIAL_PRINTLN(F("[wake] do_wake entry"));
+    float vbatV = VBAT_VOLTS();
+    setWakeDeadline(!haveStoredSession, vbatV);  /* Zero-Trust awake budget for this wake cycle */
+    if (haveStoredSession) consecutiveWatchdogTriggers = 0;
+    if (!haveStoredSession) {
+        SERIAL_PRINTLN(F("[wake] No session, join-first: skip sensor, do_send"));
+        do_send(&sendjob);
+        return;
+    }
 #if RUN_MODE == RUN_MODE_TEST
     /* Battery test: skip DS18B20 read to save current. */
     float tempC = (float)NAN;
@@ -624,14 +675,10 @@ void do_wake(osjob_t* j) {
     SERIAL_PRINT(period);
     SERIAL_PRINT(F(" haveStoredSession="));
     SERIAL_PRINTLN(haveStoredSession ? 1 : 0);
-    if (haveStoredSession) {
-        persistentData.magic = PERSIST_MAGIC_V2;
-        persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
-    } else {
-        persistentData.magic = 0;
-        persistentData.devEuiTag = 0;
-    }
-    /* Lazy write: no session persist in do_wake; commit only in do_sleep when measuresInPeriod==0 or after join. */
+    /* Reach here only with haveStoredSession (join-first returns earlier). */
+    persistentData.magic = PERSIST_MAGIC_V2;
+    persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
+    /* Lazy write: no session persist in do_wake; commit in do_sleep (when seqnoUp guard passes), EV_TXCOMPLETE, or after join. */
 
     SERIAL_PRINT(F("Wake #"));
     SERIAL_PRINT(persistentData.wakeCounter);
@@ -640,7 +687,6 @@ void do_wake(osjob_t* j) {
     SERIAL_PRINT(F(" Temp="));
     SERIAL_PRINTLN(tempC);
 
-    float vbatV = VBAT_VOLTS();
     if (vbatV < VBAT_CRITICAL_THRESHOLD_V) {
         SERIAL_PRINTLN(F("[wake] Critical VBat, skip send, 600 s sleep"));
         do_sleep(&sendjob);
@@ -669,7 +715,7 @@ void do_wake(osjob_t* j) {
 #include <USB/USBDevice.h>
 #endif
 
-/* do_sleep: proactive hand-off; no wait for radio idle. Session saved when send cycle complete (measuresInPeriod==0). */
+/* do_sleep: proactive hand-off; no wait for radio idle. Session persisted here only when seqnoUp increased (see guard below); otherwise EV_TXCOMPLETE or watchdog path persists. */
 void do_sleep(osjob_t* j) {
     (void)j;
     SERIAL_PRINTLN(F("[sleep] do_sleep entry"));
@@ -682,16 +728,22 @@ void do_sleep(osjob_t* j) {
     SERIAL_PRINTLN(millis());
     SERIAL_PRINT(F("[sleep] haveStoredSession="));
     SERIAL_PRINTLN(haveStoredSession ? 1 : 0);
-    if (persistentData.measuresInPeriod == 0u && haveStoredSession && !skipPersist) {
+    /* Persist only when seqnoUp increased (avoids redundant write after EV_TXCOMPLETE; avoids overwriting with 0 after watchdog LMIC_reset). */
+    if (persistentData.measuresInPeriod == 0u && haveStoredSession && !skipPersist
+        && (uint32_t)LMIC.seqnoUp != persistentData.seqnoUp && (uint32_t)LMIC.seqnoUp > persistentData.seqnoUp) {
         save_session_to_flash();  /* includes delay(20) */
     } else {
         delay(10);  /* allow any prior NVM write to complete before deep sleep (SAMD21) */
     }
 
     float vbatV = VBAT_VOLTS();
-    /* Critical: 600 s; low: double interval; normal: SLEEP_SECONDS. */
+    /* Critical: 600 s; low: double interval; normal: SLEEP_SECONDS; hibernation: 1 h after 3x join watchdog. */
     uint32_t effectiveSleepMs;
-    if (vbatV < VBAT_CRITICAL_THRESHOLD_V) {
+    if (hibernationRequested) {
+        effectiveSleepMs = 3600000UL;  /* 1 h */
+        hibernationRequested = false;
+        consecutiveWatchdogTriggers = 0;
+    } else if (vbatV < VBAT_CRITICAL_THRESHOLD_V) {
         effectiveSleepMs = 600000UL;  /* 10 min */
     } else if (vbatV < VBAT_LOW_THRESHOLD_V) {
         effectiveSleepMs = (uint32_t)SLEEP_SECONDS * 2000UL;
@@ -720,6 +772,7 @@ void do_sleep(osjob_t* j) {
     SERIAL_PRINT(F("[DEV] Sleep wait over — waking @ millis="));
     SERIAL_PRINTLN(millis());
 #else
+    /* Radio DIO pins (3, 6): LMIC remains idle after reset/sleep; no explicit detach before deepSleep. */
 #if DETACH_USB_BEFORE_SLEEP
     USBDevice.detach();
 #endif
@@ -821,12 +874,44 @@ void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, LOW);   /* DEV: blink on send; TEST/PROD: off */
 #if RUN_MODE != RUN_MODE_TEST
+    /* OneWire bus init only; no 2 s conversion. Join-first: do_wake skips sensor read until haveStoredSession. */
     sensors.begin();
 #endif
     ramCount = 0;
+    setWakeDeadline(!haveStoredSession, VBAT_VOLTS());
     do_wake(&sendjob);
 }
 
 void loop() {
     os_runloop_once();
+    /* Rollover-safe: signed delta for 30–90 s windows. */
+    if (wakeDeadlineMs != 0 && (int32_t)(millis() - wakeDeadlineMs) >= 0) {
+        watchdogTriggeredLastWake = true;
+        if (!haveStoredSession) {
+            consecutiveWatchdogTriggers++;
+            if (consecutiveWatchdogTriggers >= 3) {
+                hibernationRequested = true;
+                SERIAL_PRINTLN(F("[watchdog] CRITICAL FAILURE: Entering 1-hour hibernation"));
+            }
+        }
+        SERIAL_PRINTLN(F("[watchdog] AWAKE LIMIT REACHED. Forcing sleep."));
+#if RUN_MODE == RUN_MODE_DEV
+        Serial.flush();
+#endif
+        if (haveStoredSession && (uint32_t)LMIC.seqnoUp != persistentData.seqnoUp)
+            save_session_to_flash();
+        consecutivePort0Downlinks = 0;
+        LMIC_reset();
+        LMIC.opmode = 0;  /* Clear opmode so next wake starts clean. */
+        LMIC_setClockError(MAX_CLOCK_ERROR * 15 / 100);
+        APP_DISABLE_LMIC_DUTY_CYCLE();
+#if RUN_MODE == RUN_MODE_DEV
+        if (hibernationRequested) {
+            Serial.flush();
+            delay(100);
+        }
+#endif
+        os_setTimedCallback(&sendjob, os_getTime(), do_sleep);
+        wakeDeadlineMs = millis() + 60000;  /* prevent re-trigger until do_sleep runs */
+    }
 }

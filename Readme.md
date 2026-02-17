@@ -65,9 +65,9 @@ The sketch uses a **batched log flow**:
 - **Send:** It builds one uplink with battery voltage plus the batched entries and attempts the LoRaWAN uplink (up to 43 entries per uplink to stay within EU868 payload limit).
 - **Confirm:** On success it clears the Flash log; on failure it keeps the data in Flash and retries on the next send wake with the next batch merged in.
 
-Time is kept by the RTC (RTCZero) across sleep; epoch is persisted in flash and restored after power loss. **RTC is synced from the network** via LoRaWAN DeviceTimeReq/DeviceTimeAns (first after EV_JOINED, then at most once per 24 h). Session is saved on join and restored on wake. Sleep: 5 min (300 s) for all RUN_MODEs (see sketch). **Battery operation:** ensure `DETACH_USB_BEFORE_SLEEP` is enabled (default in PROD) so sleep current reaches ~5–15 µA; otherwise ~10 mA USB leakage. At startup the sketch prints **Starting VBat=…**; below **3.4 V** the sleep interval is doubled (e.g. 600 s); below **3.2 V** (critical) the device skips TX and sleeps 600 s to avoid brown-out during LoRa burst. **BOD33** is set to 2.7 V for clean shutdown during TX. DS18B20 read has a **2 s timeout**; on timeout temperature is sent as error (0xFFFF). **Spreading factor:** Default SF7; if link is dead three times in a row the next uplink uses SF8 for one cycle (better for weak coverage), then back to SF7. **Cold Boot test:** pull battery, reattach; verify device joins at SF7 and resumes correct seqnoUp from flash (no drift); after 3× EV_LINK_DEAD the next cycle may use SF8.
+Time is kept by the RTC (RTCZero) across sleep; epoch is persisted in flash and restored after power loss. **RTC is synced from the network** via LoRaWAN DeviceTimeReq/DeviceTimeAns (first after EV_JOINED, then at most once per 24 h). Session is saved on join and restored on wake. Sleep: 5 min (300 s) for all RUN_MODEs (see sketch). **Battery operation:** ensure `DETACH_USB_BEFORE_SLEEP` is enabled (default in PROD) so sleep current reaches ~5–15 µA; otherwise ~10 mA USB leakage. At startup the sketch prints **Starting VBat=…**; below **3.4 V** the sleep interval is doubled (e.g. 600 s); below **3.2 V** (critical) the device skips TX and sleeps 600 s to avoid brown-out during LoRa burst. **BOD33** is set to 2.7 V for clean shutdown during TX. Ensure a 1000µF capacitor on the supply to prevent false resets during the SF7 TX spike. DS18B20 read has a **2 s timeout**; on timeout temperature is sent as error (0xFFFF). **Spreading factor:** Default SF7; if link is dead three times in a row the next uplink uses SF8 for one cycle (better for weak coverage), then back to SF7. **Cold Boot test:** pull battery, reattach; verify device joins at SF7 and resumes correct seqnoUp from flash (no drift); after 3× EV_LINK_DEAD the next cycle may use SF8.
 
-**Payload format (v2.6 implicit time)** (big-endian): `[vbat_hi, vbat_lo]` (battery × 100), `[n]` (entry count, 0–43), `[baseTick_hi, baseTick_mid, baseTick_lo]` (24-bit 1-min tick for first entry), then for each entry `[temp_hi, temp_lo]` (2 bytes). Entry *i* timestamp = baseTick + *i*×5 minutes since epoch. Temperature: 0–3000 = centidegrees; 0xFFFD/0xFFFE/0xFFFF = over/under/error. Max size 6+2×43 = 92 bytes. **You must use the v2.6 decoder** from [`ttn-decoder-batch.js`](ttn-decoder-batch.js) (implicit-time format); older decoders will not parse correctly.
+**Payload format (v2.8):** **FPort 1** = batch (7-byte header): `[vbat_hi, vbat_lo]`, `[flags]` (bit0 = watchdog), `[n]`, `[baseTick_3B]`, then `[temp_hi, temp_lo]`×n. **FPort 4** = 3-byte time request when RTC not yet synced: `[vbat_hi, vbat_lo, 0x00]`. Entry *i* timestamp = baseTick + *i*×5 min since epoch. Temperature: 0–3000 = centidegrees; 0xFFFD/0xFFFE/0xFFFF = over/under/error. Max batch 7+2×43 bytes. Use the decoder from [`ttn-decoder-batch.js`](ttn-decoder-batch.js) (FPort 1 batch, FPort 2 HELLO, FPort 4 time_request).
 
 In [TTN Console](https://console.thethingsnetwork.org/) (or [The Things Stack](https://console.thethings.network/)) → Application → Payload Formats: set to **Custom** and paste the decoder from [`ttn-decoder-batch.js`](ttn-decoder-batch.js), or use this:
 
@@ -84,18 +84,36 @@ function decodeUplink(input) {
   if (!b || b.length === 0) return { data: {} };
   if (typeof b.slice === 'function') b = Array.from(b);
 
-  if (input.fPort === 2) {
+  if (input.fPort != null && Number(input.fPort) === 4 && b.length >= 3) {
+    var battery_v = (((b[0] << 8) | b[1]) >>> 0) / 100;
+    return { data: { battery_v: battery_v, time_request: true } };
+  }
+  if (input.fPort != null && Number(input.fPort) === 2) {
     var text = '';
     for (var t = 0; t < b.length; t++) text += String.fromCharCode(b[t] & 0xFF);
     return { data: { message: text } };
   }
+  if ((input.fPort != null && Number(input.fPort) !== 1) || b.length < 6) return { data: {} };
 
-  if (b.length < 6 || (b.length - 6) % 2 !== 0) return { data: {} };
-
-  var battery_v = (((b[0] << 8) | b[1]) >>> 0) / 100;
-  var n = b[2] & 0xFF;
-  var baseTick = ((b[3] << 16) | (b[4] << 8) | b[5]) >>> 0;
-  var maxN = (b.length - 6) >> 1;
+  var headerLen, battery_v, flags, n, baseTick, entryStart;
+  if (b.length >= 7 && (b.length - 7) % 2 === 0) {
+    headerLen = 7;
+    battery_v = (((b[0] << 8) | b[1]) >>> 0) / 100;
+    flags = b[2] & 0xFF;
+    n = b[3] & 0xFF;
+    baseTick = ((b[4] << 16) | (b[5] << 8) | b[6]) >>> 0;
+    entryStart = 7;
+  } else if ((b.length - 6) % 2 === 0) {
+    headerLen = 6;
+    battery_v = (((b[0] << 8) | b[1]) >>> 0) / 100;
+    flags = 0;
+    n = b[2] & 0xFF;
+    baseTick = ((b[3] << 16) | (b[4] << 8) | b[5]) >>> 0;
+    entryStart = 6;
+  } else {
+    return { data: {} };
+  }
+  var maxN = (b.length - headerLen) >> 1;
   if (n > maxN) n = maxN;
 
   var customEpoch = 1735689600 * 1000;
@@ -108,7 +126,7 @@ function decodeUplink(input) {
 
   var entries = [];
   for (var i = 0; i < n; i++) {
-    var j = 6 + i * 2;
+    var j = entryStart + i * 2;
     var temp = ((b[j] << 8) | b[j + 1]) >>> 0;
     var ts;
     if (baseTick === 0 && receivedAtMs !== null && n > 0) {
@@ -127,8 +145,9 @@ function decodeUplink(input) {
       entries.push({ timestamp: ts, temperature_c: Number((temp / 100).toFixed(2)) });
     }
   }
-
-  return { data: { battery_v: battery_v, entries: entries } };
+  var data = { battery_v: battery_v, entries: entries };
+  if (headerLen === 7 && (flags & 1)) data.watchdog_triggered = true;
+  return { data: data };
 }
 ```
 

@@ -1,74 +1,72 @@
 /**
- * TTN / The Things Stack custom payload decoder for M0 batched log uplinks (v2.6 implicit-time format).
- * Payload (big-endian): [vbat_hi, vbat_lo] (V×100), [n], [baseTick_hi, baseTick_mid, baseTick_lo], [temp_hi, temp_lo] × n (2 bytes per entry).
- * Entry i timestamp = baseTick + i*5 minutes since custom epoch (5-min spacing). baseTick 24-bit.
- * Temperature: 0–3000 = centidegrees (÷100 → °C); 0xFFFD => >30°C, 0xFFFE => <0°C, 0xFFFF = error.
- * When baseTick is 0 (RTC not synced), timestamps derived from received_at and 5-min spacing.
+ * TTN / The Things Stack custom payload decoder for M0 batched log uplinks (v2.8).
+ * FPort 1: batch 7-byte header [vbat, flags, n, baseTick_3B] + 2×n; flags bit0 = watchdog_triggered.
+ * FPort 2: HELLO WORLD string. FPort 4: 3-byte time request [vbat_hi, vbat_lo, 0x00] (time_request: true).
+ * v2.6 legacy: 6-byte header (no flags). Entry i timestamp = baseTick + i*5 min since custom epoch.
  *
  * In Console → Application → Payload Formats → Custom: paste this as decoder.
- * Accepts input.bytes (byte array) or input.frm_payload (base64 string) for compatibility.
  */
 function decodeUplink(input) {
   var b = input.bytes;
-  if (!b || b.length === 0) {
-    if (input.frm_payload && typeof atob === 'function') {
-      var raw = atob(input.frm_payload);
-      b = [];
-      for (var i = 0; i < raw.length; i++) b.push(raw.charCodeAt(i));
-    }
-  }
   if (!b || b.length === 0) return { data: {} };
-  if (typeof b.slice === 'function') b = Array.from(b);
 
   // FPort 2: simple HELLO WORLD string uplink
   if (input.fPort === 2) {
     var text = '';
-    for (var t = 0; t < b.length; t++) {
-      text += String.fromCharCode(b[t] & 0xFF);
-    }
+    for (var t = 0; t < b.length; t++) text += String.fromCharCode(b[t] & 0xFF);
     return { data: { message: text } };
   }
 
-  // FPort 1: batched log (v2.6 implicit time: 6-byte header + 2 bytes per entry)
-  if (b.length < 6) return { data: {} };
-  if ((b.length - 6) % 2 !== 0) return { data: {} };
+  // FPort 4: 3-byte time request when RTC not synced
+  if (input.fPort === 4 && b.length >= 2) {
+    var battery_v = (((b[0] << 8) | b[1]) >>> 0) / 100;
+    return { data: { battery_v: battery_v, time_request: true } };
+  }
+
+  // FPort 1: batch with 7-byte header [vbat(2)] [flags(1)] [n(1)] [baseTick(3)] = 7 bytes
+  if (b.length < 7) return { data: {} };
 
   var battery_v = (((b[0] << 8) | b[1]) >>> 0) / 100;
-  var n = b[2] & 0xFF;
-  var baseTick = ((b[3] << 16) | (b[4] << 8) | b[5]) >>> 0;
-  var maxN = (b.length - 6) >> 1;
-  if (n > maxN) n = maxN;
+  var flags = b[2] & 0xFF;
+  var n = b[3] & 0xFF;
+  var baseTick = ((b[4] << 16) | (b[5] << 8) | b[6]) >>> 0;
 
-  var customEpoch = 1735689600 * 1000;
-  var receivedAtMs = null;
-  if (input.recvTime && typeof input.recvTime.getTime === 'function') {
-    receivedAtMs = input.recvTime.getTime();
-  } else if (input.uplink_message && input.uplink_message.received_at) {
-    receivedAtMs = new Date(input.uplink_message.received_at).getTime();
-  }
+  var watchdog_triggered = (flags & 0x01) !== 0;
+
+  var customEpoch = 1735689600 * 1000; // 2026-01-01
+  var receivedAtMs = new Date(input.recvTime || Date.now()).getTime();
 
   var entries = [];
   for (var i = 0; i < n; i++) {
-    var j = 6 + i * 2;
+    var j = 7 + i * 2; // Offset by 7-byte header
+    if (j + 1 >= b.length) break;
+
     var temp = ((b[j] << 8) | b[j + 1]) >>> 0;
     var ts;
-    if (baseTick === 0 && receivedAtMs !== null && n > 0) {
-      var offsetMs = (n - 1 - i) * 300 * 1000;
-      ts = new Date(receivedAtMs - offsetMs).toISOString();
+
+    // Implicit timing: entry i is at baseTick + (i * 5 minutes)
+    if (baseTick === 0) {
+      // RTC not synced: backfill from receipt time
+      ts = new Date(receivedAtMs - (n - 1 - i) * 300000).toISOString();
     } else {
-      var tickMinutes = baseTick + i * 5;
-      ts = new Date(customEpoch + tickMinutes * 60 * 1000).toISOString();
+      var tickMinutes = baseTick + (i * 5);
+      ts = new Date(customEpoch + tickMinutes * 60000).toISOString();
     }
-    if (temp === 0xFFFF) {
-      entries.push({ timestamp: ts, temperature_state: 'error' });
-    } else if (temp === 0xFFFE) {
-      entries.push({ timestamp: ts, temperature_state: 'under_range' });
-    } else if (temp === 0xFFFD) {
-      entries.push({ timestamp: ts, temperature_state: 'over_range' });
-    } else {
-      entries.push({ timestamp: ts, temperature_c: Number((temp / 100).toFixed(2)) });
-    }
+
+    var result = { timestamp: ts };
+    if (temp === 0xFFFF) result.temperature_state = 'error';
+    else if (temp === 0xFFFE) result.temperature_state = 'under_range';
+    else if (temp === 0xFFFD) result.temperature_state = 'over_range';
+    else result.temperature_c = Number((temp / 100).toFixed(2));
+
+    entries.push(result);
   }
 
-  return { data: { battery_v: battery_v, entries: entries } };
+  return {
+    data: {
+      battery_v: battery_v,
+      watchdog_triggered: watchdog_triggered,
+      entries: entries
+    }
+  };
 }
