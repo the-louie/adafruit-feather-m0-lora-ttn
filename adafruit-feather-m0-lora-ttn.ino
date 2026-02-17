@@ -46,7 +46,7 @@ typedef struct LogEntryS AppLogEntry;
  * Batched log (c) 2026 by the_louie:
  *  - measure every 5 min (DEV, TEST, PROD), append log entry (temperature; time implicit from baseTick at send) to RAM; on send wake merge RAM to Flash, attempt uplink; on success clear Flash, on failure keep Flash and retry next send wake.
  *  - Payload: FPort 1 = batch [vbat×100][flags][n][baseTick_3B][temperature_2B × n] (v2.7 7-byte header); FPort 4 = 3-byte time request [vbat_hi,vbat_lo,0x00] when RTC not yet synced (~93 bytes max batch). Optional later: FPort 5 = v2.8 format (decoder branches on fPort).
- *  - RTC keeps time across sleep; epoch persisted in flash. RTC synced via DeviceTimeReq (first after EV_JOINED, ≤1/24 h).
+ *  - RTC keeps time across sleep; epoch persisted in flash. RTC synced via DeviceTimeReq (first after EV_JOINED, then when last sync >12 h ago).
  *  - Session saved on join, restored on wake.
  *
  * TTN / LMIC behaviour: Duty cycle disabled; 5-min sleep cycle enforces EU868. Zero-Trust watchdog: if awake exceeds budget (30 s data / 90 s join / 15 s low VBat), force LMIC_reset and do_sleep; optional Watchdog Bit in payload (flags bit0) for TTN visibility.
@@ -92,8 +92,8 @@ RTCZero rtc;
 /* GPS epoch (1980-01-06 00:00:00 UTC) to Unix epoch (1970-01-01), minus leap seconds (~18). Used when LMIC returns DeviceTimeAns (GPS seconds). */
 #define GPS_TO_UNIX_EPOCH_OFFSET 315964782u
 
-/* Request network time at most this often (seconds). TTN fair use: once per 24 h is sufficient. */
-#define NETWORK_TIME_REQUEST_INTERVAL_SEC  (24 * 3600)
+/* Request network time when last sync was more than 12 h ago; perform at next (current) wake/send. */
+#define NETWORK_TIME_REQUEST_INTERVAL_SEC  (12 * 3600)
 
 /* RX window clock error: 20% for Feather M0 internal oscillator / RX2 window (DeviceTimeAns). */
 
@@ -172,7 +172,7 @@ typedef struct {
     uint8_t artKey[16];
     uint32_t seqnoUp;  /* uplink frame counter; must increase for NS to accept after reset */
     uint32_t rtcEpoch; /* last known Unix time (seconds since Epoch); restored on boot, updated after TX and after network-time sync */
-    uint32_t lastTimeSyncEpoch; /* last Unix time we got from DeviceTimeAns; used to throttle requests to once per 24 h */
+    uint32_t lastTimeSyncEpoch; /* last Unix time we got from DeviceTimeAns; used to throttle requests to once per 12 h */
     uint8_t measuresInPeriod;   /* 0..(SEND_PERIOD_MEASURES-1): wakes since last send; SEND_PERIOD_MEASURES-th triggers backup+send */
     uint64_t devEuiTag;  /* LORAWAN_DEV_EUI when session was saved; restore only if matches current device */
 } PersistentData_t;
@@ -276,7 +276,7 @@ const lmic_pinmap lmic_pins = {
     .dio = {3, 6, LMIC_UNUSED_PIN},
 };
 
-/* Callback when DeviceTimeAns is received. LMIC gives GPS seconds; convert to Unix and set RTC. Throttle requests to once per 24 h. */
+/* Callback when DeviceTimeAns is received. LMIC gives GPS seconds; convert to Unix and set RTC. Throttle requests to once per 12 h. */
 static void userNetworkTimeCallback(void *pUserData, int flagSuccess) {
     (void)pUserData;
     if (flagSuccess != 1) {
@@ -596,7 +596,7 @@ void do_send(osjob_t* j) {
     }
 
     /* 5-min cycle (DEV, TEST, PROD) keeps EU868 duty within limits. */
-    /* Request network time at most once per 24 h (TTN fair use). First uplink after join already requested in EV_JOINED. */
+    /* If last sync was more than 12 h ago, request time sync at this wake. First uplink after join already requested in EV_JOINED. */
     uint32_t nowEpoch = (uint32_t)rtc.getEpoch();
     if (nowEpoch >= lastSync + NETWORK_TIME_REQUEST_INTERVAL_SEC)
         LMIC_requestNetworkTime(userNetworkTimeCallback, NULL);
