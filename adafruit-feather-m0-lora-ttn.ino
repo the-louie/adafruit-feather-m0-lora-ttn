@@ -10,7 +10,7 @@ typedef struct LogEntryS AppLogEntry;
 /* No-op when LMIC does not provide LMIC_disableDutyCycle. To enable duty-cycle bypass, use a library that provides it and replace with LMIC_disableDutyCycle(). */
 #define APP_DISABLE_LMIC_DUTY_CYCLE() ((void)0)
 
-/* Firmware v3.1 – Clean-Join: no post-join HELLO; single FPort 10/20 batch after join then sleep. Timeless: time from gateway received_at. FPort 10 = 300 s, FPort 20 = 10800 s. 4-byte header (vbat, flags, sequence). Join-first; 90 s join budget; delta sleep. */
+/* Firmware v3.2 – Commissioning priority: stay-awake and no deep sleep until haveStoredSession && validationCycles>=2; do_send does not force sleep on OP_TXRXPEND when !haveStoredSession. v3.1: 5s app watchdog, 12s join watchdog; do_sleep persists only when lastTxFPort>0 or watchdog; macRetryFallbackJob init; MAC reset timeout fallback. Clean-Join: single FPort 10/20 batch after join. FPort 10 = 300 s, FPort 20 = 10800 s. 4-byte header (vbat, flags, sequence). Join-first; 90 s join budget; delta sleep. FIRMWARE_VERSION_V32 mismatch in setup() forces validationCycles=0. */
 
 /*******************************************************************************
  * Copyright (c) 2015 Thomas Telkamp and Matthijs Kooijman
@@ -49,9 +49,9 @@ typedef struct LogEntryS AppLogEntry;
  *  - Session saved on join, restored on wake.
  *
  * TTN / LMIC behaviour: Duty cycle disabled; 5-min sleep cycle enforces EU868. Zero-Trust watchdog: if awake exceeds budget (30 s data / 90 s join / 15 s low VBat), force LMIC_reset and do_sleep; optional Watchdog Bit in payload (flags bit0) for TTN visibility.
+ * App watchdog: 5s after EV_TXSTART (data) or 12s after EV_JOIN_TXCOMPLETE (join), if completion never fires, force do_sleep. MAC reset retry: 4s fallback if EV_TXSTART not seen. do_sleep: persist only when lastTxFPort>0 or watchdog (bypass for pure MAC).
  * SF7 default, ADR off. After 3 consecutive EV_LINK_DEAD the device uses SF8 for one send cycle then reverts to SF7. All uplinks Unconfirmed (no ACK/retries).
- * 20% clock error after every LMIC_reset (Feather M0 oscillator / RX2 window). SeqNo persisted in EV_TXCOMPLETE
- * only when completed TX was application data (FPort > 0); MAC-only completions skip flash. do_sleep does not wait for radio idle (proactive hand-off); session saved when send cycle complete. MAC throttle: >3 consecutive Port 0 downlinks trigger LMIC reset and duty-cycle disable. Link Check on after join. EV_LINK_DEAD triggers LMIC_reset and re-join. do_send allows at most one 10 s reschedule when OP_TXRXPEND; on second blocked attempt forces sleep. RX2 from Join Accept.
+ * 20% clock error after every LMIC_reset (Feather M0 oscillator / RX2 window). SeqNo persisted in EV_TXCOMPLETE only when completed TX was application data (FPort > 0); MAC-only completions skip flash. do_sleep does not wait for radio idle (proactive hand-off); session saved when send cycle complete. v3.2: Stay-awake and no deep sleep until haveStoredSession && validationCycles>=2; do_send does not force sleep on OP_TXRXPEND when !haveStoredSession. MAC throttle: >3 consecutive Port 0 downlinks trigger LMIC reset and duty-cycle disable. Link Check on after join. EV_LINK_DEAD triggers LMIC_reset and re-join. do_send allows at most one 10 s reschedule when OP_TXRXPEND (with session); on second blocked attempt forces sleep. RX2 from Join Accept.
  *
  * If updates stop: (1) TTN Live Data: "Join Request without Join Accept" = timing/clock;
  * "Uplink dropped" = frame counter. (2) Confirm DIO1 (RFM95) to pin 6 (M0); without it no RX.
@@ -91,7 +91,7 @@ DallasTemperature sensors(&oneWire);
 #define FPORT_INTERVAL_5MIN  10   /* 300 s interval; decoder uses FPort to infer interval. */
 #define FPORT_INTERVAL_3H    20   /* 10800 s (3 h) interval. */
 #define INTERVAL_SEC_DEV_TEST  300u
-#define INTERVAL_SEC_PROD      10800u
+#define INTERVAL_SEC_PROD      10800u  /* TTN decoder must use same FPort→interval: FPort 10 = 300 s, FPort 20 = 10800 s; change ttn-decoder-batch.js if PROD interval changes. */
 
 #if RUN_MODE == RUN_MODE_DEV
 #define MEASURE_INTERVAL_SEC  300u
@@ -111,6 +111,10 @@ DallasTemperature sensors(&oneWire);
 /* EU868 data rate indices: DR5=SF7 (default), DR4=SF8 (one cycle after 3× EV_LINK_DEAD). */
 #define SF7_DR_EU868 5
 #define SF8_DR_EU868 4
+
+/* Application watchdog: if EV_TXCOMPLETE never fires (e.g. MAC/stack absorbs event), force do_sleep. */
+#define APP_WATCHDOG_AFTER_TX_SEC 5u   /* Data TX: 5s after EV_TXSTART */
+#define APP_WATCHDOG_JOIN_SEC 12u      /* Join: 12s after EV_JOIN_TXCOMPLETE (RX1+RX2+Feather M0 processing margin) */
 
 /* Serial and logging only in DEV; TEST and PROD do not init Serial or log. */
 #if RUN_MODE == RUN_MODE_DEV
@@ -136,6 +140,8 @@ static uint8_t ramCount;  /* number of valid entries in dataBuffer */
 #define PERSIST_MAGIC   0x4C4D4943u  /* "LMIC" - legacy; session restore accepted once */
 #define PERSIST_MAGIC_V2 0x4C4D4944u  /* V2: includes devEuiTag; restore only if tag matches current DevEUI */
 /* LORAWAN_DEV_EUI for session tag is in app-device-config.h; must match DEVEUI below. */
+/** v3.2: Version marker; mismatch in setup() forces validationCycles=0 (first boot after flash or firmware upgrade). */
+#define FIRMWARE_VERSION_V32 0x00030200u
 
 typedef struct {
     uint32_t magic;
@@ -147,12 +153,14 @@ typedef struct {
     uint32_t seqnoUp;  /* uplink frame counter; must increase for NS to accept after reset */
     uint8_t measuresInPeriod;   /* 0..(SEND_PERIOD_MEASURES-1): wakes since last send; SEND_PERIOD_MEASURES-th triggers backup+send */
     uint64_t devEuiTag;  /* LORAWAN_DEV_EUI when session was saved; restore only if matches current device */
+    uint8_t validationCycles;   /* Number of completed application TX cycles after join; deep sleep allowed when >= 2. */
+    uint32_t lastFirmwareVersion;  /* FIRMWARE_VERSION_V32 when saved; mismatch forces validation period. */
 } PersistentData_t;
 
 PersistentData_t persistentData;
 FlashStorage(persistentStore, PersistentData_t);
 
-#define LOG_FLASH_MAGIC 0x4C4F4732  /* "LOG2" - 5-byte AppLogEntry; legacy, not read as entries in v2.6 */
+#define LOG_FLASH_MAGIC 0x4C4F4732  /* "LOG2" - legacy format; v3.1 uses LOG3 only for entries. */
 #define LOG_FLASH_MAGIC_V3 0x4C4F4733u  /* "LOG3" - 2-byte AppLogEntry, newest-first; time from gateway received_at */
 typedef struct {
     uint32_t magic;
@@ -175,9 +183,13 @@ static const u1_t PROGMEM APPKEY[16] = LORAWAN_APP_KEY_ARR;
 void os_getDevKey (u1_t* buf) { memcpy_P(buf, APPKEY, 16);}
 
 static osjob_t sendjob;
+/** MAC storm fallback job; LMIC os_setTimedCallback supports multiple concurrent osjob_t. */
+static osjob_t macRetryFallbackJob;
+/** Set when MAC storm reset schedules do_send; cleared when EV_TXSTART fires or do_send queues. mac_retry_fallback at 4s forces do_sleep if still set. */
+static bool macStormRetryPending = false;
 static bool haveStoredSession;
 
-/** OP_TXRXPEND: at most one 10 s reschedule of do_send; on second blocked attempt we force sleep to save battery. */
+/** OP_TXRXPEND: at most one 10 s reschedule of do_send when session exists; on second blocked attempt we force sleep. v3.2: When !haveStoredSession (commissioning) we reschedule in 10 s without forcing sleep; 90 s Join Watchdog unchanged. */
 #define DO_SEND_PEND_RESCHEDULE_MAX 1
 static uint8_t do_send_pend_retries;
 
@@ -211,7 +223,7 @@ static void setWakeDeadline(bool isJoinPhase, float vbatV) {
     wakeDeadlineMs = millis() + ms;
 }
 
-/** FPort of last application TX (batch=10/20). MAC-only (Port 0) completions do not set this; we only persist to flash when lastTxFPort > 0. */
+/** FPort of last application TX (batch=10/20). Set in do_send before LMIC_setTxData2; do not clear in EV_JOINED so first post-join TX completion triggers persist and do_sleep. MAC-only (Port 0) completions do not set this; we only persist to flash when lastTxFPort > 0. */
 static uint8_t lastTxFPort;
 /** Set true at boot; cleared after first successful batch TX. Flags bit 1 in payload (cold boot/reset). */
 static bool coldBootThisRun = true;
@@ -219,13 +231,16 @@ static bool coldBootThisRun = true;
 void do_wake(osjob_t* j);  /* measure, append, then backup+send or sleep */
 void do_send(osjob_t* j);
 void do_sleep(osjob_t* j);
+static void app_watchdog_sleep(osjob_t* j);   /* 5s after EV_TXSTART if EV_TXCOMPLETE never fired */
+static void join_watchdog_sleep(osjob_t* j);  /* 12s after EV_JOIN_TXCOMPLETE if EV_JOINED/EV_JOIN_FAILED never fired */
+static void mac_retry_fallback(osjob_t* j);   /* 4s after MAC storm reset if EV_TXSTART never fired */
 
-/** Commit session to flash. Call sites: EV_JOINED; EV_TXCOMPLETE when last TX was application (lastTxFPort > 0); do_sleep when measuresInPeriod==0 && haveStoredSession && !skipPersist && seqnoUp increased. Reads LMIC at call time. */
-static void save_session_to_flash(void) {
+/** Commit session to flash. updateSeqnoFromLmic: when false, do not overwrite seqnoUp from LMIC (use after watchdog so LMIC_reset does not corrupt stored seqnoUp). Call sites: EV_JOINED; EV_TXCOMPLETE when last TX was application; do_sleep when measuresInPeriod==0 && lastTxFPort>0 && seqnoUp increased or when watchdogTriggeredLastWake; app_watchdog_sleep (false). */
+static void save_session_to_flash(bool updateSeqnoFromLmic = true) {
     if (!haveStoredSession) return;
     persistentData.magic = PERSIST_MAGIC_V2;
     persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
-    persistentData.seqnoUp = (uint32_t)LMIC.seqnoUp;
+    if (updateSeqnoFromLmic) persistentData.seqnoUp = (uint32_t)LMIC.seqnoUp;
     SERIAL_PRINTLN(F("[persist] Committing to Flash..."));
     persistentStore.write(persistentData);
     delay(20);
@@ -239,8 +254,33 @@ const lmic_pinmap lmic_pins = {
     .dio = {3, 6, LMIC_UNUSED_PIN},
 };
 
-/** Classify downlink: dataLen==0 = Port 0 (MAC-only); dataLen>0 then FPort from LMIC.frame[LMIC.dataBeg-1]. Update consecutivePort0Downlinks; if > threshold, LMIC_reset + disableDutyCycle + session restore + schedule do_send, return true. */
-static bool updatePort0CounterAndMaybeReset(void) {
+/** MAC storm fallback: if do_send at 2s did not trigger EV_TXSTART, force sleep to avoid 90s hang. */
+static void mac_retry_fallback(osjob_t* j) {
+    (void)j;
+    if (!macStormRetryPending) return;
+    macStormRetryPending = false;
+    SERIAL_PRINTLN(F("[MAC] Retry fallback: EV_TXSTART not seen, forcing sleep"));
+    os_setTimedCallback(&sendjob, os_getTime(), do_sleep);
+}
+
+/** App-watchdog path: EV_TXCOMPLETE was ghosted. Persist with save_session_to_flash(false) to preserve wakeCounter; LMIC.seqnoUp may be stale. Next wake may re-send; acceptable for reliability. */
+static void app_watchdog_sleep(osjob_t* j) {
+    (void)j;
+    if (haveStoredSession)
+        save_session_to_flash(false);
+    os_setTimedCallback(&sendjob, os_getTime(), do_sleep);
+}
+
+/** Join-phase watchdog: EV_JOINED/EV_JOIN_FAILED never arrived. Sleep (no session to persist); device retries join on next wake. */
+static void join_watchdog_sleep(osjob_t* j) {
+    (void)j;
+    SERIAL_PRINTLN(F("[join] Join Accept missed, forcing sleep"));
+    do_sleep(&sendjob);
+}
+
+/** Classify downlink: dataLen==0 = Port 0 (MAC-only); dataLen>0 then FPort from LMIC.frame[LMIC.dataBeg-1]. Update consecutivePort0Downlinks; if > threshold, LMIC_reset + disableDutyCycle + session restore + schedule do_send, return true.
+ * appTxFPort: FPort of completed TX when called from EV_TXCOMPLETE; 0 when from EV_RXCOMPLETE. Used to clear log when app batch was sent before reset. */
+static bool updatePort0CounterAndMaybeReset(uint8_t appTxFPort) {
     if (LMIC.dataLen == 0) {
         consecutivePort0Downlinks++;
     } else if (LMIC.dataBeg >= 1) {
@@ -254,8 +294,19 @@ static bool updatePort0CounterAndMaybeReset(void) {
     }
     if (consecutivePort0Downlinks <= MAC_STORM_PORT0_THRESHOLD)
         return false;
+    /* Reset path schedules do_send in 2s; that send completes via EV_TXCOMPLETE or app watchdog. Timeout fallback: mac_retry_fallback at 4s forces do_sleep if EV_TXSTART never fires. */
     SERIAL_PRINTLN(F("[MAC] >3 consecutive Port 0 downlinks, reset to break storm"));
     consecutivePort0Downlinks = 0;
+    /* Persist current seqnoUp before LMIC_reset; otherwise restore would use stale value and NS rejects next uplink. */
+    if (haveStoredSession) {
+        persistentData.seqnoUp = (uint32_t)LMIC.seqnoUp;
+        save_session_to_flash();
+    }
+    if (appTxFPort == FPORT_INTERVAL_5MIN || appTxFPort == FPORT_INTERVAL_3H) {
+        persistentLog.magic = 0;
+        persistentLog.count = 0;
+        logStore.write(persistentLog);
+    }
     LMIC_reset();
     LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);  /* 20% for Feather M0 internal oscillator / RX2 window */
     APP_DISABLE_LMIC_DUTY_CYCLE();
@@ -266,7 +317,9 @@ static bool updatePort0CounterAndMaybeReset(void) {
         LMIC_setDrTxpow(5, 14);
     }
     skipPersistDueToMacStorm = true;
+    macStormRetryPending = true;
     os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(2), do_send);
+    os_setTimedCallback(&macRetryFallbackJob, os_getTime() + sec2osticks(4), mac_retry_fallback);
     return true;
 }
 
@@ -315,6 +368,8 @@ void onEvent (ev_t ev) {
 #if RUN_MODE != RUN_MODE_TEST
             sensors.begin();
 #endif
+            /* Overwrites join watchdog; EV_TXSTART (app watchdog) or EV_TXCOMPLETE will overwrite this before it fires. */
+            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(90), do_sleep);
             break;
         case EV_RFU1:
             SERIAL_PRINTLN(F("EV_RFU1"));
@@ -349,19 +404,22 @@ void onEvent (ev_t ev) {
                 SERIAL_PRINTLN(LMIC.dataLen);
             }
             if ((LMIC.txrxFlags & TXRX_ACK) || (LMIC.dataLen > 0)) {
-                if (updatePort0CounterAndMaybeReset())
-                    break;
+                if (updatePort0CounterAndMaybeReset(lastTxFPort))
+                    break;  /* Schedules do_send at 2s + mac_retry_fallback at 4s; no do_sleep here */
             }
-            /* Update session in RAM; commit to flash only when completed TX was application (FPort > 0) to avoid NVM stress during MAC storms. */
+            /* Sleep after any radio completion (data or MAC); persist/log only when lastTxFPort > 0. */
             persistentData.magic = PERSIST_MAGIC_V2;
             persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
             persistentData.seqnoUp = (uint32_t)LMIC.seqnoUp;
             if (lastTxFPort > 0u) {
                 consecutiveLinkDeadCount = 0;  /* Success breaks consecutive link-dead streak */
+                coldBootThisRun = false;  /* first completed application TX clears boot-event bit */
+                if (persistentData.validationCycles < 2u) persistentData.validationCycles++;
                 save_session_to_flash();
                 SERIAL_PRINTLN(F("[persist] App data sent. Committing SeqNo."));
+                SERIAL_PRINT(F("[valid] Cycle count: "));
+                SERIAL_PRINTLN(persistentData.validationCycles);
                 if (lastTxFPort == FPORT_INTERVAL_5MIN || lastTxFPort == FPORT_INTERVAL_3H) {
-                    coldBootThisRun = false;
                     SERIAL_PRINTLN(F("[persist] EV_TXCOMPLETE: logStore.write (clear log)"));
                     persistentLog.magic = 0;
                     persistentLog.count = 0;
@@ -372,7 +430,7 @@ void onEvent (ev_t ev) {
                 SERIAL_PRINTLN(F("[persist] MAC-only response. Skipping flash."));
             }
             SERIAL_PRINTLN(F("[persist] EV_TXCOMPLETE: schedule do_sleep in 2s"));
-            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(2), do_sleep);
+            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(2), do_sleep);  /* Overwrites app watchdog if set */
             break;
         case EV_LOST_TSYNC:
             SERIAL_PRINTLN(F("EV_LOST_TSYNC"));
@@ -386,7 +444,7 @@ void onEvent (ev_t ev) {
                 SERIAL_PRINT(F("[downlink] EV_RXCOMPLETE len="));
                 SERIAL_PRINTLN(LMIC.dataLen);
             }
-            (void)updatePort0CounterAndMaybeReset();
+            (void)updatePort0CounterAndMaybeReset(0);
             break;
         case EV_LINK_DEAD:
             SERIAL_PRINTLN(F("EV_LINK_DEAD - LMIC_reset, re-join"));
@@ -405,11 +463,17 @@ void onEvent (ev_t ev) {
         case 16:
             SERIAL_PRINTLN(F("EV_SCAN_FOUND (MCCI/extended)"));
             break;
-        case 17:
+        case 17: {
             SERIAL_PRINTLN(F("EV_TXSTART (radio TX started)"));
             SERIAL_PRINT(F("EV_TXSTART datarate="));
             SERIAL_PRINTLN(LMIC.datarate);  /* 5 = DR5/SF7; any other value suggests override, investigate */
+            macStormRetryPending = false;   /* MAC storm retry path: TX started, fallback not needed */
+            if (lastTxFPort > 0u) {
+                /* Application watchdog: if EV_TXCOMPLETE never fires (e.g. MAC/stack absorbs event), app_watchdog_sleep runs 5s after EV_TXSTART. */
+                os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(APP_WATCHDOG_AFTER_TX_SEC), app_watchdog_sleep);
+            }
             break;
+        }
         case 18:
             SERIAL_PRINTLN(F("EV_TXCANCELED (MCCI/extended)"));
             break;
@@ -418,6 +482,8 @@ void onEvent (ev_t ev) {
             break;
         case 20:
             SERIAL_PRINTLN(F("EV_JOIN_TXCOMPLETE (Join Request sent, waiting Join Accept)"));
+            /* Join-phase watchdog: if Join Accept is missed, sleep after 12s instead of waiting 90s hardware watchdog. */
+            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(APP_WATCHDOG_JOIN_SEC), join_watchdog_sleep);
             break;
         default:
             SERIAL_PRINT(F("Unknown event "));
@@ -455,6 +521,12 @@ void do_send(osjob_t* j) {
     (void)j;
     SERIAL_PRINTLN(F("[send] do_send entry"));
     if (LMIC.opmode & OP_TXRXPEND) {
+        /* Commissioning priority: do not force sleep on busy radio if session is not yet established. */
+        if (!haveStoredSession) {
+            SERIAL_PRINTLN(F("[send] OP_TXRXPEND, reschedule do_send in 10s (commissioning)"));
+            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(10), do_send);
+            return;
+        }
         do_send_pend_retries++;
         if (do_send_pend_retries <= DO_SEND_PEND_RESCHEDULE_MAX) {
             SERIAL_PRINTLN(F("[send] OP_TXRXPEND, reschedule do_send in 10s"));
@@ -462,6 +534,7 @@ void do_send(osjob_t* j) {
         } else {
             SERIAL_PRINTLN(F("[send] Radio busy, forcing sleep to save battery"));
             do_send_pend_retries = 0;  /* next wake gets one reschedule again */
+            macStormRetryPending = false;  /* Avoid mac_retry_fallback double-sleep when coming from MAC storm path */
             os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(0), do_sleep);
         }
         return;
@@ -499,7 +572,9 @@ void do_send(osjob_t* j) {
 #if RUN_MODE == RUN_MODE_DEV
     blinkLed();   /* attempting to send */
 #endif
+    /* Set lastTxFPort before LMIC_setTxData2 so EV_TXCOMPLETE and app watchdog can identify application TX even if stack delays or merges events. */
     lastTxFPort = targetPort;
+    macStormRetryPending = false;   /* MAC storm retry: packet queued, EV_TXSTART will fire */
     /* All uplinks Unconfirmed (4th arg 0) for battery life; no ACK wait/retries. */
     LMIC_setTxData2(targetPort, paybuf, (uint8_t)payLen, 0);
     SERIAL_PRINTLN(F("[send] Packet queued (batch)"));
@@ -550,6 +625,7 @@ void do_wake(osjob_t* j) {
     if (haveStoredSession) consecutiveWatchdogTriggers = 0;
     if (!haveStoredSession) {
         SERIAL_PRINTLN(F("[wake] No session, join-first: skip sensor, do_send"));
+        /* do_send performs OP_TXRXPEND check internally before queuing. */
         do_send(&sendjob);
         return;
     }
@@ -575,6 +651,7 @@ void do_wake(osjob_t* j) {
 #endif
 
     /* Recent-first: new reading at index 0; shift existing right so decoder sees newest first (anchor - i*interval). */
+    if (ramCount > LOG_ENTRIES_MAX) ramCount = LOG_ENTRIES_MAX;  /* defensive cap */
     if (ramCount < LOG_ENTRIES_MAX) {
         memmove(dataBuffer + 1, dataBuffer, ramCount * sizeof(AppLogEntry));
         dataBuffer[0] = e;
@@ -633,6 +710,7 @@ void do_wake(osjob_t* j) {
 void do_sleep(osjob_t* j) {
     (void)j;
     SERIAL_PRINTLN(F("[sleep] do_sleep entry"));
+    bool afterWatchdog = watchdogTriggeredLastWake;  /* capture before persist block may clear it */
     bool skipPersist = false;
     if (skipPersistDueToMacStorm) {
         skipPersist = true;
@@ -642,13 +720,21 @@ void do_sleep(osjob_t* j) {
     SERIAL_PRINTLN(millis());
     SERIAL_PRINT(F("[sleep] haveStoredSession="));
     SERIAL_PRINTLN(haveStoredSession ? 1 : 0);
-    /* Persist only when seqnoUp increased (avoids redundant write after EV_TXCOMPLETE; avoids overwriting with 0 after watchdog LMIC_reset). */
-    if (persistentData.measuresInPeriod == 0u && haveStoredSession && !skipPersist
-        && (uint32_t)LMIC.seqnoUp != persistentData.seqnoUp && (uint32_t)LMIC.seqnoUp > persistentData.seqnoUp) {
-        save_session_to_flash();  /* includes delay(20) */
-    } else {
-        delay(10);  /* allow any prior NVM write to complete before deep sleep (SAMD21) */
+    /* After watchdog: persist wakeCounter (and session) without overwriting seqnoUp from LMIC (LMIC_reset zeroed it). */
+    bool didPersist = false;
+    if (watchdogTriggeredLastWake && haveStoredSession && !skipPersist) {
+        save_session_to_flash(false);
+        watchdogTriggeredLastWake = false;
+        didPersist = true;
     }
+    /* Persist only when seqnoUp increased AND lastTxFPort>0 (avoids redundant write; avoids overwriting with 0 after watchdog; bypass for pure MAC completion to save Flash wear). */
+    if (!didPersist && persistentData.measuresInPeriod == 0u && haveStoredSession && !skipPersist && lastTxFPort > 0u
+        && (uint32_t)LMIC.seqnoUp != persistentData.seqnoUp && (uint32_t)LMIC.seqnoUp > persistentData.seqnoUp) {
+        save_session_to_flash();
+        didPersist = true;
+    }
+    if (!didPersist)
+        delay(10);  /* allow any prior NVM write to complete before deep sleep (SAMD21) */
 
     float vbatV = VBAT_VOLTS();
     /* Critical: 600 s; low: double interval; hibernation: 1 h. Normal: delta sleep to keep period accurate (interval - awake). */
@@ -662,6 +748,8 @@ void do_sleep(osjob_t* j) {
         effectiveSleepMs = 600000UL;  /* 10 min */
     } else if (vbatV < VBAT_LOW_THRESHOLD_V) {
         effectiveSleepMs = (uint32_t)SLEEP_SECONDS * 2000UL;
+    } else if (afterWatchdog) {
+        effectiveSleepMs = intervalMs;  /* fixed recovery; wakeStartMs is from previous do_wake and is stale */
     } else {
         uint32_t awakeDurationMs = (uint32_t)(millis() - wakeStartMs);
         if (awakeDurationMs < intervalMs)
@@ -669,6 +757,7 @@ void do_sleep(osjob_t* j) {
         else
             effectiveSleepMs = 1000UL;  /* floor 1 s if awake exceeded interval */
     }
+    if (afterWatchdog) watchdogTriggeredLastWake = false;  /* clear in all paths so next cycle uses normal delta */
 
 #if RUN_MODE == RUN_MODE_DEV
     SERIAL_PRINT(F("[DEV] Entering sleep wait — "));
@@ -686,19 +775,36 @@ void do_sleep(osjob_t* j) {
                 lastHeartbeatMs = millis();
             }
             delay(100);
+            if (Serial) Serial.flush();
         }
     }
     SERIAL_PRINT(F("[DEV] Sleep wait over — waking @ millis="));
     SERIAL_PRINTLN(millis());
 #else
-    /* Radio DIO pins (3, 6): LMIC remains idle after reset/sleep; no explicit detach before deepSleep. */
-#if DETACH_USB_BEFORE_SLEEP
-    USBDevice.detach();
+    /* Stay awake on bench during commissioning/validation; skip deepSleep. */
+    bool stayAwake = !haveStoredSession || (persistentData.validationCycles < 2u);
+    if (stayAwake) {
+        /* Chunked wait with Serial flush so SAMD21 buffer does not overflow if USB is detached (1.2.5, 1.2.6). */
+        uint32_t elapsed = 0u;
+        const uint32_t chunkMs = 5000u;
+        while (elapsed < effectiveSleepMs) {
+            uint32_t step = (effectiveSleepMs - elapsed >= chunkMs) ? chunkMs : (effectiveSleepMs - elapsed);
+            delay(step);
+#if RUN_MODE == RUN_MODE_DEV
+            if (Serial) Serial.flush();
 #endif
-    LowPower.deepSleep(effectiveSleepMs);
+            elapsed += step;
+        }
+    } else {
+        /* Radio DIO pins (3, 6): LMIC remains idle after reset/sleep; no explicit detach before deepSleep. */
 #if DETACH_USB_BEFORE_SLEEP
-    USBDevice.attach();
+        USBDevice.detach();
 #endif
+        LowPower.deepSleep(effectiveSleepMs);
+#if DETACH_USB_BEFORE_SLEEP
+        USBDevice.attach();
+#endif
+    }
 #endif
     do_wake(&sendjob);
 }
@@ -756,6 +862,15 @@ void setup() {
     } else {
         persistentData.measuresInPeriod = persistentData.measuresInPeriod % SEND_PERIOD_MEASURES;
     }
+    /* v3.2 Join-Persistence Integrity: force validation on first boot after flash or firmware version change. */
+    if (persistentData.lastFirmwareVersion != FIRMWARE_VERSION_V32) {
+        persistentData.validationCycles = 0;
+        persistentData.lastFirmwareVersion = FIRMWARE_VERSION_V32;
+    }
+    if (!haveStoredSession)
+        persistentData.validationCycles = 0;
+    else if (persistentData.validationCycles > 2u)
+        persistentData.validationCycles = 2;  /* Backward compat: clamp legacy or corrupted flash. */
     SERIAL_PRINTLN(F("[setup] logStore.read"));
     logStore.read(&persistentLog);
     SERIAL_PRINT(F("Wake #"));
@@ -763,6 +878,7 @@ void setup() {
 
     SERIAL_PRINTLN(F("[setup] os_init LMIC_reset LMIC_setClockError"));
     os_init();
+    memset(&macRetryFallbackJob, 0, sizeof(macRetryFallbackJob));  /* Init before first MAC reset can occur */
     LMIC_reset();
     LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);  /* 20% for Feather M0 internal oscillator / RX2 window */
     APP_DISABLE_LMIC_DUTY_CYCLE();  /* Application enforces 300 s sleep; LMIC duty would cause long awake-waits */
@@ -810,10 +926,10 @@ void loop() {
         }
         SERIAL_PRINTLN(F("[watchdog] AWAKE LIMIT REACHED. Forcing sleep."));
 #if RUN_MODE == RUN_MODE_DEV
-        Serial.flush();  /* DEV only; PROD has Serial compiled out. */
+        if (Serial) Serial.flush();
 #endif
-        if (haveStoredSession && (uint32_t)LMIC.seqnoUp != persistentData.seqnoUp)
-            save_session_to_flash();
+        /* Session/wakeCounter persisted in do_sleep with save_session_to_flash(false) to avoid overwriting seqnoUp after LMIC_reset. */
+        macStormRetryPending = false;  /* Avoid stale mac_retry_fallback firing after wake */
         consecutivePort0Downlinks = 0;
         LMIC_reset();
         LMIC.opmode = 0;  /* Clear opmode so next wake starts clean. */
@@ -821,7 +937,7 @@ void loop() {
         APP_DISABLE_LMIC_DUTY_CYCLE();
 #if RUN_MODE == RUN_MODE_DEV
         if (hibernationRequested) {
-            Serial.flush();  /* DEV only; PROD has Serial compiled out. */
+            if (Serial) Serial.flush();
             delay(100);
         }
 #endif
