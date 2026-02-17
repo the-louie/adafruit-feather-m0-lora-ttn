@@ -2,6 +2,7 @@
  * TTN / The Things Stack custom payload decoder for M0 batched log uplinks (v2.8).
  * FPort 1: batch 7-byte header [vbat, flags, n, baseTick_3B] + 2×n; flags bit0 = watchdog_triggered.
  * FPort 2: HELLO WORLD string. FPort 4: 3-byte time request [vbat_hi, vbat_lo, 0x00] (time_request: true).
+ * When baseTick === 0 (e.g. 4 h app-layer fallback without RTC sync), entry timestamps use received_at (recvTime) for 5-min alignment.
  * v2.6 legacy: 6-byte header (no flags). Entry i timestamp = baseTick + i*5 min since custom epoch.
  *
  * In Console → Application → Payload Formats → Custom: paste this as decoder.
@@ -46,7 +47,7 @@ function decodeUplink(input) {
 
     // Implicit timing: entry i is at baseTick + (i * 5 minutes)
     if (baseTick === 0) {
-      // RTC not synced: backfill from receipt time
+      // baseTick=0: RTC not synced or 4h fallback; use received_at for 5-min sample alignment
       ts = new Date(receivedAtMs - (n - 1 - i) * 300000).toISOString();
     } else {
       var tickMinutes = baseTick + (i * 5);

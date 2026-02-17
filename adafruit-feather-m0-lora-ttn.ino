@@ -51,7 +51,7 @@ typedef struct LogEntryS AppLogEntry;
  *
  * TTN / LMIC behaviour: Duty cycle disabled; 5-min sleep cycle enforces EU868. Zero-Trust watchdog: if awake exceeds budget (30 s data / 90 s join / 15 s low VBat), force LMIC_reset and do_sleep; optional Watchdog Bit in payload (flags bit0) for TTN visibility.
  * SF7 default, ADR off. After 3 consecutive EV_LINK_DEAD the device uses SF8 for one send cycle then reverts to SF7. All uplinks Unconfirmed (no ACK/retries).
- * 15% clock error after every LMIC_reset (crystal drift / long sleep RX windows). SeqNo persisted in EV_TXCOMPLETE
+ * 20% clock error after every LMIC_reset (Feather M0 oscillator / RX2 window). SeqNo persisted in EV_TXCOMPLETE
  * only when completed TX was application data (FPort > 0); MAC-only completions skip flash. do_sleep does not wait for radio idle (proactive hand-off); session saved when send cycle complete. MAC throttle: >3 consecutive Port 0 downlinks trigger LMIC reset and duty-cycle disable. Link Check on after join. EV_LINK_DEAD triggers LMIC_reset and re-join. do_send allows at most one 10 s reschedule when OP_TXRXPEND; on second blocked attempt forces sleep. RX2 from Join Accept.
  *
  * If updates stop: (1) TTN Live Data: "Join Request without Join Accept" = timing/clock;
@@ -95,7 +95,7 @@ RTCZero rtc;
 /* Request network time at most this often (seconds). TTN fair use: once per 24 h is sufficient. */
 #define NETWORK_TIME_REQUEST_INTERVAL_SEC  (24 * 3600)
 
-/* RX window clock error: 15% in setup() for Feather M0 internal oscillator; compensates for crystal drift over long runs (e.g. 36 h). */
+/* RX window clock error: 20% for Feather M0 internal oscillator / RX2 window (DeviceTimeAns). */
 
 /* RUN_MODE: DEV = 5 min, Serial, 10 s startup delay (upload window; M0 has no boot selector);
  * TEST = 5 min, Serial, no startup delay; PROD = 5 min, no Serial, no startup delay.
@@ -120,9 +120,10 @@ RTCZero rtc;
 #define SLEEP_SECONDS        300
 #endif
 
-/* EU868 data rate indices for failure-based SF bump: DR5=SF7 (default), DR4=SF8 (one cycle after 3× EV_LINK_DEAD). */
+/* EU868 data rate indices: DR5=SF7 (default), DR4=SF8 (one cycle after 3× EV_LINK_DEAD), DR3=SF9 (FPort 4 after 3× time request fail). */
 #define SF7_DR_EU868 5
 #define SF8_DR_EU868 4
+#define SF9_DR_EU868 3
 
 /* Serial and logging only in DEV; TEST and PROD do not init Serial or log. */
 #if RUN_MODE == RUN_MODE_DEV
@@ -228,6 +229,16 @@ static bool watchdogTriggeredLastWake = false;
 static uint8_t consecutiveWatchdogTriggers = 0;
 static bool hibernationRequested = false;
 
+/** Adaptive join backoff: EV_JOIN_FAILED retry delay 10 min / 30 min / 1 h (RAM-only, reset on EV_JOINED). */
+static uint8_t consecutiveJoinFailCount = 0;
+
+/** Time request failure count: after 3× DeviceTimeReq failure use SF9 for next FPort 4 uplink. Reset on success. */
+static uint8_t consecutiveTimeRequestFailCount = 0;
+
+/** Wakes without time sync: after 48 (4 h at 5 min) send batch with baseTick=0; decoder uses received_at. */
+#define WAKES_WITHOUT_TIME_SYNC_THRESHOLD 48u
+static uint8_t wakesWithoutTimeSync = 0;
+
 /** Set wake deadline for this wake cycle (join vs data, VBat-aware). Zero-Trust awake budget. */
 static void setWakeDeadline(bool isJoinPhase, float vbatV) {
     uint32_t ms = (vbatV < VBAT_LOW_THRESHOLD_V) ? MAX_AWAKE_LOW_VBAT_MS
@@ -269,11 +280,13 @@ const lmic_pinmap lmic_pins = {
 static void userNetworkTimeCallback(void *pUserData, int flagSuccess) {
     (void)pUserData;
     if (flagSuccess != 1) {
+        if (consecutiveTimeRequestFailCount < 255u) consecutiveTimeRequestFailCount++;
         SERIAL_PRINTLN(F("Network time request failed"));
         return;
     }
     lmic_time_reference_t lmicTimeRef;
     if (!LMIC_getNetworkTimeReference(&lmicTimeRef)) {
+        if (consecutiveTimeRequestFailCount < 255u) consecutiveTimeRequestFailCount++;
         SERIAL_PRINTLN(F("Network time reference unavailable"));
         return;
     }
@@ -285,10 +298,12 @@ static void userNetworkTimeCallback(void *pUserData, int flagSuccess) {
     persistentData.lastTimeSyncEpoch = unixEpoch;
     persistentData.magic = PERSIST_MAGIC_V2;
     persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
+    consecutiveTimeRequestFailCount = 0;
+    wakesWithoutTimeSync = 0;
     /* RAM only; session committed to flash at send cycle or after join via save_session_to_flash(). */
     SERIAL_PRINT(F("RTC synced to epoch: "));
     SERIAL_PRINTLN(unixEpoch);
-    /* Catch-up: first successful time sync with pending RAM data triggers send in 10 s. */
+    /* Implicit catch-up: first successful time sync with pending RAM data triggers do_send in 10 s to drain backlog. */
     if ((prevSync == 0u || prevSync == 0xFFFFFFFFu) && ramCount > 0u)
         os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(10), do_send);
 }
@@ -311,7 +326,7 @@ static bool updatePort0CounterAndMaybeReset(void) {
     SERIAL_PRINTLN(F("[MAC] >3 consecutive Port 0 downlinks, reset to break storm"));
     consecutivePort0Downlinks = 0;
     LMIC_reset();
-    LMIC_setClockError(MAX_CLOCK_ERROR * 15 / 100);
+    LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);  /* 20% for Feather M0 internal oscillator / RX2 window */
     APP_DISABLE_LMIC_DUTY_CYCLE();
     if (haveStoredSession) {
         LMIC_setSession(persistentData.netid, (u4_t)persistentData.devaddr, persistentData.nwkKey, persistentData.artKey);
@@ -345,6 +360,7 @@ void onEvent (ev_t ev) {
             break;
         case EV_JOINED:
             SERIAL_PRINTLN(F("EV_JOINED"));
+            consecutiveJoinFailCount = 0;  /* Success resets join backoff. */
             lastTxFPort = 0;
             consecutivePort0Downlinks = 0;  /* Fresh join; clear MAC Port 0 counter. */
             LMIC_setLinkCheckMode(1);
@@ -365,19 +381,27 @@ void onEvent (ev_t ev) {
             SERIAL_PRINTLN(persistentData.seqnoUp);
             save_session_to_flash();
             LMIC_requestNetworkTime(userNetworkTimeCallback, NULL);
-            /* Join-First power isolation: enable sensor power only after successful join (if using a power pin for DS18B20). */
+            /* Join-first power isolation: sensors.begin() only after EV_JOINED so OneWire/Pin 5 stay inert during join. */
+#if RUN_MODE != RUN_MODE_TEST
+            sensors.begin();
+#endif
             /* Delay first uplink so TTN NS can finalize session (3–5 s). */
             os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(5), post_join_first_uplink);
             break;
         case EV_RFU1:
             SERIAL_PRINTLN(F("EV_RFU1"));
             break;
-        case EV_JOIN_FAILED:
+        case EV_JOIN_FAILED: {
             SERIAL_PRINTLN(F("EV_JOIN_FAILED"));
-            SERIAL_PRINTLN(F("[EV] EV_JOIN_FAILED: schedule do_send (retry) in 60s"));
-            // Retry join after 60 s (no Join Accept in RX window; avoid blocking runloop during join).
-            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(60), do_send);
+            if (consecutiveJoinFailCount < 255u) consecutiveJoinFailCount++;
+            if (consecutiveJoinFailCount > 3u) consecutiveJoinFailCount = 3u;
+            uint32_t backoffSec = (consecutiveJoinFailCount == 1u) ? 600u : (consecutiveJoinFailCount == 2u) ? 1800u : 3600u;
+            SERIAL_PRINT(F("[EV] EV_JOIN_FAILED: retry do_send in "));
+            SERIAL_PRINT(backoffSec);
+            SERIAL_PRINTLN(F("s (adaptive backoff)"));
+            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(backoffSec), do_send);
             break;
+        }
         case EV_REJOIN_FAILED:
             SERIAL_PRINTLN(F("EV_REJOIN_FAILED"));
             break;
@@ -439,7 +463,7 @@ void onEvent (ev_t ev) {
         case EV_LINK_DEAD:
             SERIAL_PRINTLN(F("EV_LINK_DEAD - LMIC_reset, re-join"));
             LMIC_reset();
-            LMIC_setClockError(MAX_CLOCK_ERROR * 15 / 100);
+            LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);  /* 20% for Feather M0 / RX2 window */
             APP_DISABLE_LMIC_DUTY_CYCLE();
             haveStoredSession = false;
             /* After 3 consecutive EV_LINK_DEAD use SF8 for one cycle. */
@@ -543,9 +567,24 @@ void do_send(osjob_t* j) {
 
     uint32_t lastSync = persistentData.lastTimeSyncEpoch;
     uint16_t vbatCentivolt = (uint16_t)(VBAT_VOLTS() * 100.0f);
-    /* Time gating: when RTC has never been synced, send only 3-byte time request on FPort 4; do not build batch. */
+    /* Time gating: when RTC has never been synced, send FPort 4 time request or, after >4 h, batch with baseTick=0. */
     if (lastSync == 0u || lastSync == 0xFFFFFFFFu) {
+        if (wakesWithoutTimeSync < 255u) wakesWithoutTimeSync++;
+        if (wakesWithoutTimeSync >= WAKES_WITHOUT_TIME_SYNC_THRESHOLD) {
+            /* Application-layer fallback: MAC time sync failed >4 h; send batch with baseTick=0; decoder uses received_at. */
+            if (ramCount > 0u) mergeBackupAndPrepareSend();
+            uint8_t n = (persistentLog.count <= LOG_SEND_CAP) ? persistentLog.count : (uint8_t)LOG_SEND_CAP;
+            uint8_t paybuf[7 + 2 * LOG_SEND_CAP];
+            uint16_t payLen = buildBatchPayload(paybuf, vbatCentivolt, n, persistentLog.entries, 0u);
+            lastTxFPort = 1;
+            LMIC_setTxData2(1, paybuf, (uint8_t)payLen, 0);
+            SERIAL_PRINTLN(F("[send] Batch (baseTick=0, 4h fallback)"));
+            return;
+        }
         LMIC_requestNetworkTime(userNetworkTimeCallback, NULL);
+        if (consecutiveTimeRequestFailCount >= 3u) {
+            LMIC_setDrTxpow(SF9_DR_EU868, 14);  /* SF9 for FPort 4 after 3× time request failure (better link budget). */
+        }
         uint8_t paybuf[3];
         paybuf[0] = (uint8_t)(vbatCentivolt >> 8);
         paybuf[1] = (uint8_t)(vbatCentivolt & 0xFF);
@@ -702,7 +741,7 @@ void do_wake(osjob_t* j) {
 }
 
 // STANDBY sleep via Arduino Low Power (re-inits clocks, RTC wake). LMIC's os_time does not advance during deep sleep;
-// 15% clock error in setup widens RX window for Join Accept after drift. do_sleep does not wait for radio idle (proactive hand-off).
+// 20% clock error in setup widens RX window for Join Accept and DeviceTimeAns. do_sleep does not wait for radio idle (proactive hand-off).
 // Detach USB before deep sleep so sleep current is ~5–15 µA; otherwise Feather M0 USB draws ~10 mA. Default: 1 in PROD, 0 in DEV/TEST (Serial debugging).
 #ifndef DETACH_USB_BEFORE_SLEEP
 #if RUN_MODE == RUN_MODE_PROD
@@ -825,6 +864,9 @@ void setup() {
      * and extended PersistentData_t, the last 8 bytes may read from the next slot (logStore), so devEuiTag
      * can be wrong and would reject a valid session; accept any V2 to avoid join loop. */
     haveStoredSession = (persistentData.magic == PERSIST_MAGIC) || (persistentData.magic == PERSIST_MAGIC_V2);
+    if (haveStoredSession && persistentData.devaddr == 0u) {
+        haveStoredSession = false;  /* Invalid session (DevAddr 0); force new join. */
+    }
     SERIAL_PRINT(F("[setup] haveStoredSession="));
     SERIAL_PRINTLN(haveStoredSession ? 1 : 0);
     if (!haveStoredSession) {
@@ -852,7 +894,7 @@ void setup() {
     SERIAL_PRINTLN(F("[setup] os_init LMIC_reset LMIC_setClockError"));
     os_init();
     LMIC_reset();
-    LMIC_setClockError(MAX_CLOCK_ERROR * 15 / 100);  /* 15% for crystal drift / long sleep RX windows */
+    LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);  /* 20% for Feather M0 internal oscillator / RX2 window */
     APP_DISABLE_LMIC_DUTY_CYCLE();  /* Application enforces 300 s sleep; LMIC duty would cause long awake-waits */
 
     if (haveStoredSession) {
@@ -870,13 +912,15 @@ void setup() {
         SERIAL_PRINTLN(F("[setup] no session, will OTAA join"));
     }
 
-    SERIAL_PRINTLN(F("[setup] pinMode sensors.begin do_wake"));
+    SERIAL_PRINTLN(F("[setup] pinMode do_wake"));
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, LOW);   /* DEV: blink on send; TEST/PROD: off */
+    /* Join-first power isolation: sensors.begin() only after EV_JOINED or when restoring session so data path has sensor. */
+    if (haveStoredSession) {
 #if RUN_MODE != RUN_MODE_TEST
-    /* OneWire bus init only; no 2 s conversion. Join-first: do_wake skips sensor read until haveStoredSession. */
-    sensors.begin();
+        sensors.begin();
 #endif
+    }
     ramCount = 0;
     setWakeDeadline(!haveStoredSession, VBAT_VOLTS());
     do_wake(&sendjob);
@@ -896,18 +940,18 @@ void loop() {
         }
         SERIAL_PRINTLN(F("[watchdog] AWAKE LIMIT REACHED. Forcing sleep."));
 #if RUN_MODE == RUN_MODE_DEV
-        Serial.flush();
+        Serial.flush();  /* DEV only; PROD has Serial compiled out. */
 #endif
         if (haveStoredSession && (uint32_t)LMIC.seqnoUp != persistentData.seqnoUp)
             save_session_to_flash();
         consecutivePort0Downlinks = 0;
         LMIC_reset();
         LMIC.opmode = 0;  /* Clear opmode so next wake starts clean. */
-        LMIC_setClockError(MAX_CLOCK_ERROR * 15 / 100);
+        LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);  /* 20% for Feather M0 / RX2 window */
         APP_DISABLE_LMIC_DUTY_CYCLE();
 #if RUN_MODE == RUN_MODE_DEV
         if (hibernationRequested) {
-            Serial.flush();
+            Serial.flush();  /* DEV only; PROD has Serial compiled out. */
             delay(100);
         }
 #endif
