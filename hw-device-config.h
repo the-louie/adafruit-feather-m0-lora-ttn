@@ -7,7 +7,7 @@
 #define M0_LORAWAN_TTN_HW_DEVICE_CONFIG_H
 
 /* DS18B20 one-wire data pin. 4.7 kΩ pull-up data→3V required. */
-#define ONE_WIRE_BUS  A1
+#define ONE_WIRE_BUS  A2
 
 /* Run-mode strapping: GND on pin = active. Read at cold boot only; then set INPUT for 0 µA. */
 #define STRAP_DEV_PIN  11

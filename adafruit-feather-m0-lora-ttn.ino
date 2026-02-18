@@ -223,6 +223,8 @@ static uint8_t currentFPort = FPORT_INTERVAL_3H;  /* PROD default */
 static bool detachUsbBeforeSleep = true;           /* Non-DEV: detach before deepSleep; set in configureIntervals (USB active only in DEV). */
 /** Run mode to persist to Flash (strap/version value). Set in setup() before USB override; used in save_session_to_flash() so USB-forced DEV is never written. */
 static uint8_t runModeToPersist = RUN_MODE_PROD;
+/** True when run mode was forced to DEV this boot because USB was detected (Live Boot). Logged to Serial in setup(). */
+static bool usbForcedDevMode = false;
 
 void do_wake(osjob_t* j);  /* measure, append, then backup+send or sleep */
 void do_send(osjob_t* j);
@@ -960,7 +962,7 @@ void setup() {
     /* v3.5 USB cold-boot override: RAM-only, runs on every boot (including watchdog). */
     if (isUsbCableDetected()) {
         persistentData.runMode = RUN_MODE_DEV;
-        /* CRITICAL: Do not call persistentStore.write() here. */
+        usbForcedDevMode = true;
     }
     configureIntervals(persistentData.runMode);
 #if HAVE_USB_DEVICE
@@ -973,6 +975,7 @@ void setup() {
         delay(2000);
     }
     SERIAL_PRINTLN(F("Starting"));
+    if (usbForcedDevMode) SERIAL_PRINTLN(F("USB detected: running in DEV (Live Boot)"));
     SERIAL_PRINT(F("Starting VBat="));
     SERIAL_PRINTLN(VBAT_VOLTS());
     lastTxFPort = 0;
