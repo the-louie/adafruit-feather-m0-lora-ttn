@@ -10,7 +10,7 @@ typedef struct LogEntryS AppLogEntry;
 /* No-op when LMIC does not provide LMIC_disableDutyCycle. To enable duty-cycle bypass, use a library that provides it and replace with LMIC_disableDutyCycle(). */
 #define APP_DISABLE_LMIC_DUTY_CYCLE() ((void)0)
 
-/* Firmware v3.3.0 – Hardware-strapped run mode (pins 11/12 GND-strap). Single binary; 0 µA pin leakage after read; reset-cause filtering (PM->RCAUSE). FIRMWARE_VERSION_V330 mismatch forces validationCycles=0. */
+/* Firmware v3.3.2 – Hardware-strapped run mode (pins 11/12 GND-strap). Single binary; 0 µA pin leakage after read; reset-cause filtering (PM->RCAUSE). v3.3.2: Join-first uplink includes one reading; direct-from-RAM when SEND_PERIOD_MEASURES==1 and no backlog to avoid redundant Flash write/clear. */
 
 /*******************************************************************************
  * Copyright (c) 2015 Thomas Telkamp and Matthijs Kooijman
@@ -470,10 +470,14 @@ void onEvent (ev_t ev) {
                 SERIAL_PRINT(F("[valid] Cycle count: "));
                 SERIAL_PRINTLN(persistentData.validationCycles);
                 if (lastTxFPort == FPORT_INTERVAL_5MIN || lastTxFPort == FPORT_INTERVAL_3H) {
-                    SERIAL_PRINTLN(F("[persist] EV_TXCOMPLETE: logStore.write (clear log)"));
-                    persistentLog.magic = 0;
-                    persistentLog.count = 0;
-                    logStore.write(persistentLog);
+                    ramCount = 0;  /* Clear RAM batch so next wake does not resend. */
+                    /* Only write Flash when we had valid log (avoids wear on RAM-only sends). */
+                    if (persistentLog.magic == LOG_FLASH_MAGIC_V3) {
+                        SERIAL_PRINTLN(F("[persist] EV_TXCOMPLETE: logStore.write (clear log)"));
+                        persistentLog.magic = 0;
+                        persistentLog.count = 0;
+                        logStore.write(persistentLog);
+                    }
                 }
                 lastTxFPort = 0;
             } else {
@@ -554,16 +558,24 @@ static uint16_t encodeTemperatureHighRes(float tempC) {
     return (uint16_t)v;
 }
 
-/** v3.1 payload: 4-byte header [VBat_Hi,VBat_Lo][Flags][Sequence] then 2×n temp. Flags: bit0=watchdog, bit1=cold boot. Sequence = wakeCounter & 0xFF for gap detection. */
-static uint16_t buildBatchPayload(uint8_t* buf, uint16_t vbatCentivolt, uint8_t flagsByte, uint8_t sequenceByte, uint8_t n, const AppLogEntry* entries) {
+/** Build payload from RAM then Flash (newest-first). 4-byte header [VBat_Hi,VBat_Lo][Flags][Sequence] then 2×n temp. Flags: bit0=watchdog, bit1=cold boot. Sequence = wakeCounter & 0xFF. No local AppLogEntry array; Flash entries only when caller passes flashN from magic-valid log. */
+static uint16_t buildBatchPayloadTwoSources(uint8_t* buf, uint16_t vbatCentivolt, uint8_t flagsByte, uint8_t sequenceByte,
+    const AppLogEntry* ramEntries, uint8_t ramN, const AppLogEntry* flashEntries, uint8_t flashN) {
     uint16_t i = 0;
     buf[i++] = (uint8_t)(vbatCentivolt >> 8);
     buf[i++] = (uint8_t)(vbatCentivolt & 0xFF);
     buf[i++] = flagsByte;
     buf[i++] = sequenceByte;
-    for (uint8_t k = 0; k < n && (i + 2) <= 256u; k++) {
-        buf[i++] = (uint8_t)(entries[k].temperature >> 8);
-        buf[i++] = (uint8_t)(entries[k].temperature & 0xFF);
+    uint8_t n = ramN + flashN;
+    if (n > LOG_SEND_CAP) n = (uint8_t)LOG_SEND_CAP;
+    uint8_t written = 0;
+    for (uint8_t k = 0; k < ramN && written < n && (i + 2) <= 256u; k++, written++) {
+        buf[i++] = (uint8_t)(ramEntries[k].temperature >> 8);
+        buf[i++] = (uint8_t)(ramEntries[k].temperature & 0xFF);
+    }
+    for (uint8_t k = 0; k < flashN && written < n && (i + 2) <= 256u; k++, written++) {
+        buf[i++] = (uint8_t)(flashEntries[k].temperature >> 8);
+        buf[i++] = (uint8_t)(flashEntries[k].temperature & 0xFF);
     }
     return i;
 }
@@ -603,14 +615,19 @@ void do_send(osjob_t* j) {
     }
 
     uint16_t vbatCentivolt = (uint16_t)(VBAT_VOLTS() * 100.0f);
-    /* Merge RAM into Flash so batch includes backlog; normal path already merged in do_wake. */
+    /* Merge RAM into Flash so batch includes backlog; normal path already merged in do_wake. May early-return when Flash empty and SEND_PERIOD_MEASURES==1. */
     if (ramCount > 0u) mergeBackupAndPrepareSend();
-    uint8_t n = (persistentLog.count <= LOG_SEND_CAP) ? persistentLog.count : (uint8_t)LOG_SEND_CAP;
+    /* Flash only used when magic valid (avoids sending uninitialized memory on fresh device). */
+    uint8_t flashCount = (persistentLog.magic == LOG_FLASH_MAGIC_V3 && persistentLog.count <= LOG_ENTRIES_MAX)
+        ? persistentLog.count : 0;
     uint8_t flagsByte = (watchdogTriggeredLastWake ? 1u : 0u) | (coldBootThisRun ? 2u : 0u);
     if (watchdogTriggeredLastWake) watchdogTriggeredLastWake = false;
     uint8_t sequenceByte = (uint8_t)(persistentData.wakeCounter & 0xFF);
     uint8_t paybuf[4 + 2 * LOG_SEND_CAP];
-    uint16_t payLen = buildBatchPayload(paybuf, vbatCentivolt, flagsByte, sequenceByte, n, persistentLog.entries);
+    uint16_t payLen = buildBatchPayloadTwoSources(paybuf, vbatCentivolt, flagsByte, sequenceByte,
+        dataBuffer, ramCount, persistentLog.entries, flashCount);
+    uint8_t n = ramCount + flashCount;
+    if (n > LOG_SEND_CAP) n = (uint8_t)LOG_SEND_CAP;
 
     SERIAL_PRINT(F("Sending batch n="));
     SERIAL_PRINT(n);
@@ -636,6 +653,11 @@ static void mergeBackupAndPrepareSend(void) {
     logStore.read(&persistentLog);
     uint8_t flashCount = (persistentLog.magic == LOG_FLASH_MAGIC_V3 && persistentLog.count <= LOG_ENTRIES_MAX)
         ? persistentLog.count : 0;
+    /* Skip Flash write when no backlog and send period is 1 to reduce wear; do_send will build from RAM. */
+    if (flashCount == 0 && SEND_PERIOD_MEASURES == 1u) {
+        SERIAL_PRINTLN(F("[merge] Flash empty, send from RAM to save wear"));
+        return;
+    }
     SERIAL_PRINT(F("[merge] logStore.read flashCount="));
     SERIAL_PRINT(flashCount);
     SERIAL_PRINT(F(" ramCount="));
@@ -659,7 +681,7 @@ static void mergeBackupAndPrepareSend(void) {
 /** Capture wake start for delta-sleep. Set at very start of do_wake. */
 static uint32_t wakeStartMs;
 
-/** Called after each wake (from setup or after do_sleep). Measure, append to RAM (newest at index 0), then either sleep or backup+send. */
+/** Called after each wake (from setup or after do_sleep). Critical VBat check first; then measure, append to RAM (newest at index 0), then either join-first do_send or session period logic. */
 void do_wake(osjob_t* j) {
     (void)j;
     wakeStartMs = millis();
@@ -673,12 +695,14 @@ void do_wake(osjob_t* j) {
     float vbatV = VBAT_VOLTS();
     setWakeDeadline(!haveStoredSession, vbatV);  /* Zero-Trust awake budget for this wake cycle */
     if (haveStoredSession) consecutiveWatchdogTriggers = 0;
-    if (!haveStoredSession) {
-        SERIAL_PRINTLN(F("[wake] No session, join-first: skip sensor, do_send"));
-        /* do_send performs OP_TXRXPEND check internally before queuing. */
-        do_send(&sendjob);
+
+    /* Critical VBat check before sensor read: avoid ~750 ms and ~1 mA DS18B20 when already in brown-out danger. */
+    if (vbatV < VBAT_CRITICAL_THRESHOLD_V) {
+        SERIAL_PRINTLN(F("[wake] Critical VBat, skip sensor and send, 600 s sleep"));
+        do_sleep(&sendjob);
         return;
     }
+
     float tempC;
     if (persistentData.runMode == RUN_MODE_TEST) {
         tempC = (float)NAN;  /* Battery test: skip DS18B20 read to save current. */
@@ -710,6 +734,15 @@ void do_wake(osjob_t* j) {
         dataBuffer[0] = e;
     }
 
+    /* Join-first path: wakeCounter++ before do_send so Join-Uplink carries unique sequence (avoids Sequence 0 conflicts on reboot). */
+    if (!haveStoredSession) {
+        persistentData.wakeCounter++;
+        SERIAL_PRINTLN(F("[wake] No session, join-first: do_send with one reading"));
+        do_send(&sendjob);
+        return;
+    }
+
+    /* Session path: period logic, then merge+send or sleep. */
     uint8_t period = persistentData.measuresInPeriod % SEND_PERIOD_MEASURES;
     period = (period + 1) % SEND_PERIOD_MEASURES;
     persistentData.measuresInPeriod = period;
@@ -718,7 +751,6 @@ void do_wake(osjob_t* j) {
     SERIAL_PRINT(period);
     SERIAL_PRINT(F(" haveStoredSession="));
     SERIAL_PRINTLN(haveStoredSession ? 1 : 0);
-    /* Reach here only with haveStoredSession (join-first returns earlier). */
     persistentData.magic = PERSIST_MAGIC_V2;
     persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
     /* Lazy write: no session persist in do_wake; commit in do_sleep (when seqnoUp guard passes), EV_TXCOMPLETE, or after join. */
@@ -728,12 +760,8 @@ void do_wake(osjob_t* j) {
     SERIAL_PRINT(F(" Temp="));
     SERIAL_PRINTLN(tempC);
 
-    if (vbatV < VBAT_CRITICAL_THRESHOLD_V) {
-        SERIAL_PRINTLN(F("[wake] Critical VBat, skip send, 600 s sleep"));
-        do_sleep(&sendjob);
-    } else if (period == 0) {
+    if (period == 0) {
         SERIAL_PRINTLN(F("[wake] period==0 -> mergeBackupAndPrepareSend then do_send"));
-        /* SEND_PERIOD_MEASURES-th wake: backup RAM to Flash (merge with any existing), then send. */
         mergeBackupAndPrepareSend();
         do_send(&sendjob);
     } else {
@@ -945,7 +973,8 @@ void setup() {
     SERIAL_PRINTLN(F("[setup] pinMode do_wake"));
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, LOW);   /* DEV: blink on send; TEST/PROD: off */
-    if (haveStoredSession && persistentData.runMode != RUN_MODE_TEST)
+    /* Initialize sensor before first do_wake so join path can read one value for Join uplink. */
+    if (persistentData.runMode != RUN_MODE_TEST)
         sensors.begin();
     ramCount = 0;
     setWakeDeadline(!haveStoredSession, VBAT_VOLTS());
