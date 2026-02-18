@@ -20,7 +20,7 @@ If you power the Feather via **VUSB** from an external battery (e.g. USB power b
 
 ### DS18B20 temperature sensor (optional)
 
-To add a DS18B20 one-wire temperature sensor, use **Pin 5** for the data line. Alternative: Pin 10. Pins 3, 4, 6, 8, and 9 are in use by the LoRa radio or battery sense; **pins 11 and 12 are reserved for run-mode strapping** (v3.5) and must not be used for the sensor. Wiring: DS18B20 data → chosen pin; **4.7 kΩ** pull-up from data to **3V** (required to avoid sensor hang / -127.00); GND → GND; VDD → **3V** (3.3 V operation). Install **Dallas Temperature** (Miles Burton) and **OneWire** (Paul Stoffregen) from Library Manager. See [DS18B20 pin and wiring](docs/ds18b20-pin-and-wiring.md) for details.
+To add a DS18B20 one-wire temperature sensor, use **A1** for the data line. Alternatives: A0 or A2 (A0 has the Feather M0 DAC—reserve it for audio/precision voltage if needed). Pins 3, 4, 6, 8, and 9 are in use by the LoRa radio or battery sense; **pins 11 and 12 are reserved for run-mode strapping** (v3.5) and must not be used for the sensor. Wiring: DS18B20 data → chosen pin; **4.7 kΩ** pull-up from data to **3V** (required to avoid sensor hang / -127.00); GND → GND; VDD → **3V** (3.3 V operation). Install **Dallas Temperature** (Miles Burton) and **OneWire** (Paul Stoffregen) from Library Manager. See [DS18B20 pin and wiring](docs/ds18b20-pin-and-wiring.md) for details.
 
 ## How to set up a working development environment for the Feather M0 LoRa
 
