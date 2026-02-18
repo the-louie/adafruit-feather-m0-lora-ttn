@@ -345,11 +345,14 @@ static void app_watchdog_sleep(osjob_t* j) {
     os_setTimedCallback(&sendjob, os_getTime(), do_sleep);
 }
 
-/** Join-phase watchdog: EV_JOINED/EV_JOIN_FAILED never arrived. Sleep (no session to persist); device retries join on next wake. */
+/** Join-phase watchdog: EV_JOINED/EV_JOIN_FAILED never arrived. Do NOT sleep; reset MAC and retry immediately. */
 static void join_watchdog_sleep(osjob_t* j) {
     (void)j;
-    SERIAL_PRINTLN(F("[join] Join Accept missed, forcing sleep"));
-    do_sleep(&sendjob);
+    SERIAL_PRINTLN(F("[join] Join Accept missed (watchdog), retrying immediately..."));
+    LMIC_reset();
+    LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);
+    APP_DISABLE_LMIC_DUTY_CYCLE();
+    os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(5), do_send);
 }
 
 /** Classify downlink: dataLen==0 = Port 0 (MAC-only); dataLen>0 then FPort from LMIC.frame[LMIC.dataBeg-1]. Update consecutivePort0Downlinks; if > threshold, LMIC_reset + disableDutyCycle + session restore + schedule do_send, return true.
@@ -855,10 +858,12 @@ void do_sleep(osjob_t* j) {
         delay(10);  /* allow any prior NVM write to complete before deep sleep (SAMD21) */
 
     float vbatV = VBAT_VOLTS();
-    /* Critical: 600 s; low: double interval with delta-sleep; hibernation: 1 h. Normal: delta sleep (interval - awake). */
+    /* Critical: 600 s; low: double interval with delta-sleep; hibernation: 1 h. Normal: delta sleep (interval - awake). Unjoined: short backoff so we retry quickly. */
     uint32_t intervalMs = currentMeasureInterval * 1000UL;
     uint32_t effectiveSleepMs;
-    if (hibernationRequested) {
+    if (!haveStoredSession) {
+        effectiveSleepMs = 15000UL;  /* 15 s: rapid join retry; stay-awake delay uses this instead of 3 h */
+    } else if (hibernationRequested) {
         effectiveSleepMs = 3600000UL;  /* 1 h */
         hibernationRequested = false;
         consecutiveWatchdogTriggers = 0;
@@ -879,7 +884,7 @@ void do_sleep(osjob_t* j) {
     }
     /* watchdogTriggeredLastWake cleared in do_send when building payload flags so next TX carries watchdog bit. */
 
-    /* Stay-Awake Guard: physically prevent entering standard sleep path when unjoined or not yet validated. */
+    /* Stay-Awake Guard: physically prevent entering standard sleep path when unjoined or not yet validated. When !haveStoredSession, effectiveSleepMs is 15 s above so this delay is short. */
     bool stayAwake = !haveStoredSession || (persistentData.validationCycles < 2u);
     if (stayAwake) {
         SERIAL_PRINTLN(F("[valid] Bench Mode Guard: Using delay() instead of deepSleep"));
