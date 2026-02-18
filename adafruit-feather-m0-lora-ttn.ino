@@ -10,7 +10,7 @@ typedef struct LogEntryS AppLogEntry;
 /* No-op when LMIC does not provide LMIC_disableDutyCycle. To enable duty-cycle bypass, use a library that provides it and replace with LMIC_disableDutyCycle(). */
 #define APP_DISABLE_LMIC_DUTY_CYCLE() ((void)0)
 
-/* Firmware v3.3.2 – Hardware-strapped run mode (pins 11/12 GND-strap). Single binary; 0 µA pin leakage after read; reset-cause filtering (PM->RCAUSE). v3.3.2: Join-first uplink includes one reading; direct-from-RAM when SEND_PERIOD_MEASURES==1 and no backlog to avoid redundant Flash write/clear. */
+/* Firmware v3.4 – Hardware-strapped run mode (pins 11/12 GND-strap). Single binary; 0 µA pin leakage after read; reset-cause filtering (PM->RCAUSE). v3.3.2: Join-first uplink includes one reading; direct-from-RAM when SEND_PERIOD_MEASURES==1 and no backlog. v3.4: Cold boot always uplink with data; if no flash backlog, one temperature measurement is taken and sent; first wake after cold boot may take longer. */
 
 /*******************************************************************************
  * Copyright (c) 2015 Thomas Telkamp and Matthijs Kooijman
@@ -126,8 +126,8 @@ static uint8_t ramCount;  /* number of valid entries in dataBuffer */
 #define PERSIST_MAGIC   0x4C4D4943u  /* "LMIC" - legacy; not used for session restore (V2 only). */
 #define PERSIST_MAGIC_V2 0x4C4D4944u  /* V2: session restore only when magic==V2 and devaddr!=0. */
 /* LORAWAN_DEV_EUI for session tag is in app-device-config.h; must match DEVEUI below. */
-/** v3.3.0: Version marker; mismatch in setup() forces validationCycles=0 (first boot after flash or firmware upgrade). Only version constant in use. */
-#define FIRMWARE_VERSION_V330 0x00030300u
+/** Version marker; mismatch in setup() forces validationCycles=0 (first boot after flash or firmware upgrade). */
+#define FIRMWARE_VERSION_V340 0x00030400u
 
 typedef struct {
     uint32_t magic;
@@ -142,7 +142,7 @@ typedef struct {
     uint8_t validationCycles;   /* Number of completed application TX cycles after join; deep sleep allowed when >= 2. */
     uint8_t runMode;            /* Runtime mode from hardware strapping (pins 11/12); packed with validationCycles. */
     uint8_t reserved_padding[2]; /* Explicit padding for 4-byte alignment of lastFirmwareVersion. */
-    uint32_t lastFirmwareVersion;  /* FIRMWARE_VERSION_V330 when saved; mismatch forces validation period. */
+    uint32_t lastFirmwareVersion;  /* FIRMWARE_VERSION_V340 when saved; mismatch forces validation period. */
 } PersistentData_t;
 
 PersistentData_t persistentData;
@@ -620,6 +620,27 @@ void do_send(osjob_t* j) {
     /* Flash only used when magic valid (avoids sending uninitialized memory on fresh device). */
     uint8_t flashCount = (persistentLog.magic == LOG_FLASH_MAGIC_V3 && persistentLog.count <= LOG_ENTRIES_MAX)
         ? persistentLog.count : 0;
+
+    /* Defensive: cold boot with no backlog – take one reading so backend sees boot_event with data (same encode path as do_wake). */
+    if (coldBootThisRun && ramCount == 0u && flashCount == 0u) {
+        float tempC;
+        if (persistentData.runMode == RUN_MODE_TEST) {
+            tempC = (float)NAN;
+            (void)tempC;
+        } else {
+            sensors.setWaitForConversion(false);
+            sensors.requestTemperatures();
+            uint32_t startMs = millis();
+            while (!sensors.isConversionComplete() && (millis() - startMs < (uint32_t)DS18B20_READ_TIMEOUT_MS))
+                delay(50);
+            tempC = (millis() - startMs < (uint32_t)DS18B20_READ_TIMEOUT_MS) ? sensors.getTempCByIndex(0) : (float)NAN;
+        }
+        AppLogEntry e;
+        e.temperature = (persistentData.runMode == RUN_MODE_TEST) ? 0xFFFFu : encodeTemperatureHighRes(tempC);
+        dataBuffer[0] = e;
+        ramCount = 1u;
+    }
+
     uint8_t flagsByte = (watchdogTriggeredLastWake ? 1u : 0u) | (coldBootThisRun ? 2u : 0u);
     if (watchdogTriggeredLastWake) watchdogTriggeredLastWake = false;
     uint8_t sequenceByte = (uint8_t)(persistentData.wakeCounter & 0xFF);
@@ -681,7 +702,7 @@ static void mergeBackupAndPrepareSend(void) {
 /** Capture wake start for delta-sleep. Set at very start of do_wake. */
 static uint32_t wakeStartMs;
 
-/** Called after each wake (from setup or after do_sleep). Critical VBat check first; then measure, append to RAM (newest at index 0), then either join-first do_send or session period logic. */
+/** Called after each wake (from setup or after do_sleep). Critical VBat check first; then measure, append to RAM (newest at index 0), then either join-first do_send or session period logic. When coldBootThisRun is true and the device has a session, the send path is forced so the first wake always uplinks data. */
 void do_wake(osjob_t* j) {
     (void)j;
     wakeStartMs = millis();
@@ -759,6 +780,14 @@ void do_wake(osjob_t* j) {
     SERIAL_PRINT(persistentData.wakeCounter);
     SERIAL_PRINT(F(" Temp="));
     SERIAL_PRINTLN(tempC);
+
+    /* Cold boot: always uplink data so backend can verify hardware stack; we already have one reading in RAM. */
+    if (coldBootThisRun) {
+        SERIAL_PRINTLN(F("[wake] Cold boot: merge then do_send"));
+        mergeBackupAndPrepareSend();
+        do_send(&sendjob);
+        return;
+    }
 
     if (period == 0) {
         SERIAL_PRINTLN(F("[wake] period==0 -> mergeBackupAndPrepareSend then do_send"));
@@ -890,13 +919,13 @@ void setup() {
     }
 #endif
     persistentStore.read(&persistentData);
-    bool versionMismatch = (persistentData.lastFirmwareVersion != FIRMWARE_VERSION_V330);
+    bool versionMismatch = (persistentData.lastFirmwareVersion != FIRMWARE_VERSION_V340);
     bool hardwareReset = isHardwareReset();
     if (versionMismatch || hardwareReset) {
         if (versionMismatch) {
             persistentData.runMode = RUN_MODE_PROD;
             updateHardwareRunMode();
-            persistentData.lastFirmwareVersion = FIRMWARE_VERSION_V330;
+            persistentData.lastFirmwareVersion = FIRMWARE_VERSION_V340;
             persistentData.validationCycles = 0;
         } else {
             updateHardwareRunMode();

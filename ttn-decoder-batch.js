@@ -1,6 +1,7 @@
 /**
  * TTN / The Things Stack custom payload decoder for M0 batched log uplinks.
  * v3.1 Timeless: FPort 10 = 300 s, FPort 20 = 10800 s. 4-byte header [vbat(2), flags(1), sequence(1)] + 2×n. Time from gateway received_at; entry i = anchor - i*interval.
+ * Flags bit 1 = cold boot (boot_event); firmware v3.4+ ensures at least one entry when boot_event is set, for backend verification of the hardware stack.
  * FPort 2: HELLO WORLD. FPort 4: legacy 3-byte time request. FPort 1: legacy v2.8 batch (7-byte header + baseTick).
  *
  * In Console → Application → Payload Formats → Custom: paste this as decoder.
