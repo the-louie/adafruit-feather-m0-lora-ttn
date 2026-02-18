@@ -20,7 +20,7 @@ If you power the Feather via **VUSB** from an external battery (e.g. USB power b
 
 ### DS18B20 temperature sensor (optional)
 
-To add a DS18B20 one-wire temperature sensor, use **Pin 5** for the data line. Alternative: Pin 10. Pins 3, 4, 6, 8, and 9 are in use by the LoRa radio or battery sense; **pins 11 and 12 are reserved for run-mode strapping** (v3.4) and must not be used for the sensor. Wiring: DS18B20 data → chosen pin; **4.7 kΩ** pull-up from data to **3V** (required to avoid sensor hang / -127.00); GND → GND; VDD → **3V** (3.3 V operation). Install **Dallas Temperature** (Miles Burton) and **OneWire** (Paul Stoffregen) from Library Manager. See [DS18B20 pin and wiring](docs/ds18b20-pin-and-wiring.md) for details.
+To add a DS18B20 one-wire temperature sensor, use **Pin 5** for the data line. Alternative: Pin 10. Pins 3, 4, 6, 8, and 9 are in use by the LoRa radio or battery sense; **pins 11 and 12 are reserved for run-mode strapping** (v3.5) and must not be used for the sensor. Wiring: DS18B20 data → chosen pin; **4.7 kΩ** pull-up from data to **3V** (required to avoid sensor hang / -127.00); GND → GND; VDD → **3V** (3.3 V operation). Install **Dallas Temperature** (Miles Burton) and **OneWire** (Paul Stoffregen) from Library Manager. See [DS18B20 pin and wiring](docs/ds18b20-pin-and-wiring.md) for details.
 
 ## How to set up a working development environment for the Feather M0 LoRa
 
@@ -69,7 +69,7 @@ The sketch uses a **batched log flow** (v3.1 Clean-Join; Timeless Resilience):
 
 **Session resumption:** Enable **Resend Frame Counter** or **Relax Frame Counter** in TTN Console if the NS rejects after restore. DevAddr 0 forces new join. **Sequence** (1 byte in header) allows the decoder/backend to detect lost reporting cycles (e.g. sequence 10 then 12 = one interval lost).
 
-**Payload format (v3.1):** **FPort 10** (300 s) / **FPort 20** (10800 s): 4-byte header `[vbat_hi, vbat_lo]`, `[flags]` (bit0 = watchdog, bit1 = cold boot), `[sequence]` (0–255), then `[temp_hi, temp_lo]`×n. Newest reading first. v3.4: On cold boot the device always sends at least one reading; if there was no backlog it takes a measurement before sending. After join only this batch is sent (no post-join HELLO). **FPort 2** = HELLO WORLD (decoder supports; firmware v3.1 does not send it on first join). **FPort 1** / **FPort 4** = legacy (decoder still supports them). Temperature: 0–3000 = centidegrees; 0xFFFD/0xFFFE/0xFFFF = over/under/error. Use [`ttn-decoder-batch.js`](ttn-decoder-batch.js).
+**Payload format (v3.1):** **FPort 10** (300 s) / **FPort 20** (10800 s): 4-byte header `[vbat_hi, vbat_lo]`, `[flags]` (bit0 = watchdog, bit1 = cold boot), `[sequence]` (0–255), then `[temp_hi, temp_lo]`×n. Newest reading first. v3.5: On cold boot the device always sends at least one reading; if there was no backlog it takes a measurement before sending. After join only this batch is sent (no post-join HELLO). **FPort 2** = HELLO WORLD (decoder supports; firmware v3.1 does not send it on first join). **FPort 1** / **FPort 4** = legacy (decoder still supports them). Temperature: 0–3000 = centidegrees; 0xFFFD/0xFFFE/0xFFFF = over/under/error. Use [`ttn-decoder-batch.js`](ttn-decoder-batch.js).
 
 In [TTN Console](https://console.thethingsnetwork.org/) (or [The Things Stack](https://console.thethings.network/)) → Application → Payload Formats: set to **Custom** and paste the decoder from [`ttn-decoder-batch.js`](ttn-decoder-batch.js), or use this:
 

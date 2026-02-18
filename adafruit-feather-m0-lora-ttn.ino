@@ -10,7 +10,7 @@ typedef struct LogEntryS AppLogEntry;
 /* No-op when LMIC does not provide LMIC_disableDutyCycle. To enable duty-cycle bypass, use a library that provides it and replace with LMIC_disableDutyCycle(). */
 #define APP_DISABLE_LMIC_DUTY_CYCLE() ((void)0)
 
-/* Firmware v3.4 – Hardware-strapped run mode (pins 11/12 GND-strap). Single binary; 0 µA pin leakage after read; reset-cause filtering (PM->RCAUSE). v3.3.2: Join-first uplink includes one reading; direct-from-RAM when SEND_PERIOD_MEASURES==1 and no backlog. v3.4: Cold boot always uplink with data; if no flash backlog, one temperature measurement is taken and sent; first wake after cold boot may take longer. */
+/* Firmware v3.5 – Hardware-strapped run mode (pins 11/12 GND-strap). Single binary; 0 µA pin leakage after read; reset-cause filtering (PM->RCAUSE). v3.3.2: Join-first uplink includes one reading; direct-from-RAM when SEND_PERIOD_MEASURES==1 and no backlog. v3.4: Cold boot always uplink with data; if no flash backlog, one temperature measurement is taken and sent; first wake after cold boot may take longer. v3.5: USB cold-boot override – when powered from USB at cold boot, run mode is forced to DEV for that boot without writing to Flash (Live Boot; reverts to straps on battery). */
 
 /*******************************************************************************
  * Copyright (c) 2015 Thomas Telkamp and Matthijs Kooijman
@@ -127,7 +127,7 @@ static uint8_t ramCount;  /* number of valid entries in dataBuffer */
 #define PERSIST_MAGIC_V2 0x4C4D4944u  /* V2: session restore only when magic==V2 and devaddr!=0. */
 /* LORAWAN_DEV_EUI for session tag is in app-device-config.h; must match DEVEUI below. */
 /** Version marker; mismatch in setup() forces validationCycles=0 (first boot after flash or firmware upgrade). */
-#define FIRMWARE_VERSION_V340 0x00030400u
+#define FIRMWARE_VERSION_V350 0x00030500u
 
 typedef struct {
     uint32_t magic;
@@ -142,7 +142,7 @@ typedef struct {
     uint8_t validationCycles;   /* Number of completed application TX cycles after join; deep sleep allowed when >= 2. */
     uint8_t runMode;            /* Runtime mode from hardware strapping (pins 11/12); packed with validationCycles. */
     uint8_t reserved_padding[2]; /* Explicit padding for 4-byte alignment of lastFirmwareVersion. */
-    uint32_t lastFirmwareVersion;  /* FIRMWARE_VERSION_V340 when saved; mismatch forces validation period. */
+    uint32_t lastFirmwareVersion;  /* FIRMWARE_VERSION_V350 when saved; mismatch forces validation period. */
 } PersistentData_t;
 
 PersistentData_t persistentData;
@@ -221,6 +221,8 @@ static uint32_t currentMeasureInterval = 10800u;   /* seconds; PROD default unti
 static uint32_t currentSleepMs = 10800000UL;      /* PROD default */
 static uint8_t currentFPort = FPORT_INTERVAL_3H;  /* PROD default */
 static bool detachUsbBeforeSleep = true;           /* Non-DEV: detach before deepSleep; set in configureIntervals (USB active only in DEV). */
+/** Run mode to persist to Flash (strap/version value). Set in setup() before USB override; used in save_session_to_flash() so USB-forced DEV is never written. */
+static uint8_t runModeToPersist = RUN_MODE_PROD;
 
 void do_wake(osjob_t* j);  /* measure, append, then backup+send or sleep */
 void do_send(osjob_t* j);
@@ -236,7 +238,10 @@ static void save_session_to_flash(bool updateSeqnoFromLmic = true) {
     persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
     if (updateSeqnoFromLmic) persistentData.seqnoUp = (uint32_t)LMIC.seqnoUp;
     SERIAL_PRINTLN(F("[persist] Committing to Flash..."));
+    uint8_t r = persistentData.runMode;
+    persistentData.runMode = runModeToPersist;  /* Never persist USB-forced DEV to Flash. */
     persistentStore.write(persistentData);
+    persistentData.runMode = r;
     delay(20);
 }
 
@@ -275,6 +280,24 @@ static void updateHardwareRunMode(void) {
         persistentData.runMode = RUN_MODE_PROD;
     pinMode(STRAP_DEV_PIN, INPUT);
     pinMode(STRAP_TEST_PIN, INPUT);
+}
+
+/** True if VBUS is present (USB cable connected). Used for cold-boot power-source identification only.
+ *  Enables the USB APB clock and waits for synchronization before reading.
+ *  Does not manage runtime USB transitions. */
+bool isUsbCableDetected(void) {
+#if defined(__SAMD21__) && defined(USBCON)
+    // 1. Enable the APB clock for the USB peripheral if not already active
+    if (!(PM->APBBMASK.reg & PM_APBBMASK_USB)) {
+        PM->APBBMASK.reg |= PM_APBBMASK_USB;
+        // 2. Latency: Wait for the clock to stabilize before register access
+        delayMicroseconds(10);
+    }
+    // 3. Now safe to read the Finite State Machine status
+    // Any state != 0 (ON, SUSPEND, SLEEP) indicates 5V on VBUS
+    return (USB->DEVICE.FSMSTATUS.bit.FSMSTATE != 0);
+#endif
+    return false;
 }
 
 /** Set runtime interval, FPort, and USB detach from persisted runMode. Call once in setup() after runMode is stable. USB only active in DEV (strapping). */
@@ -919,19 +942,25 @@ void setup() {
     }
 #endif
     persistentStore.read(&persistentData);
-    bool versionMismatch = (persistentData.lastFirmwareVersion != FIRMWARE_VERSION_V340);
+    bool versionMismatch = (persistentData.lastFirmwareVersion != FIRMWARE_VERSION_V350);
     bool hardwareReset = isHardwareReset();
     if (versionMismatch || hardwareReset) {
         if (versionMismatch) {
             persistentData.runMode = RUN_MODE_PROD;
             updateHardwareRunMode();
-            persistentData.lastFirmwareVersion = FIRMWARE_VERSION_V340;
+            persistentData.lastFirmwareVersion = FIRMWARE_VERSION_V350;
             persistentData.validationCycles = 0;
         } else {
             updateHardwareRunMode();
         }
         persistentStore.write(persistentData);
         delay(20);
+    }
+    runModeToPersist = persistentData.runMode;  /* Strap/version value; never persist USB-forced DEV. */
+    /* v3.5 USB cold-boot override: RAM-only, runs on every boot (including watchdog). */
+    if (isUsbCableDetected()) {
+        persistentData.runMode = RUN_MODE_DEV;
+        /* CRITICAL: Do not call persistentStore.write() here. */
     }
     configureIntervals(persistentData.runMode);
 #if HAVE_USB_DEVICE
