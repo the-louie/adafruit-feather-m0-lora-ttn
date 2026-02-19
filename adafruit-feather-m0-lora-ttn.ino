@@ -192,7 +192,7 @@ static bool skipPersistDueToMacStorm = false;
 
 /** Zero-Trust watchdog: MCU forces sleep when millis() exceeds this deadline regardless of radio state. */
 #define MAX_AWAKE_TIME_MS      30000   /* 30 s for data uplinks */
-#define MAX_AWAKE_JOIN_MS     90000   /* 90 s for OTAA join (handshake can exceed 60 s in poor conditions) */
+#define MAX_AWAKE_JOIN_MS     300000  /* 5 minutes to allow native LMIC duty-cycle backoffs */
 #define MAX_AWAKE_LOW_VBAT_MS 15000   /* 15 s when VBat < 3.4 V */
 static uint32_t wakeDeadlineMs = 0;
 /** Set when watchdog forces sleep; included in next batch payload (flags byte bit0), then cleared. */
@@ -333,7 +333,7 @@ static void app_watchdog_sleep(osjob_t* j) {
     if (haveStoredSession)
         save_session_to_flash(false);
     LMIC_reset();
-    LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);  /* 20% for Feather M0 / RX2 window */
+    LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);  /* 1% for Feather M0 / RX2 window */
     APP_DISABLE_LMIC_DUTY_CYCLE();
     if (haveStoredSession) {
         LMIC_setSession(persistentData.netid, (u4_t)persistentData.devaddr, persistentData.nwkKey, persistentData.artKey);
@@ -350,7 +350,7 @@ static void join_watchdog_sleep(osjob_t* j) {
     (void)j;
     SERIAL_PRINTLN(F("[join] Join Accept missed (watchdog), retrying immediately..."));
     LMIC_reset();
-    LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);
+    LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);
     APP_DISABLE_LMIC_DUTY_CYCLE();
     os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(5), do_send);
 }
@@ -385,7 +385,7 @@ static bool updatePort0CounterAndMaybeReset(uint8_t appTxFPort) {
         logStore.write(persistentLog);
     }
     LMIC_reset();
-    LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);  /* 20% for Feather M0 internal oscillator / RX2 window */
+    LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);  /* 1% for Feather M0 internal oscillator / RX2 window */
     APP_DISABLE_LMIC_DUTY_CYCLE();
     if (haveStoredSession) {
         LMIC_setSession(persistentData.netid, (u4_t)persistentData.devaddr, persistentData.nwkKey, persistentData.artKey);
@@ -417,9 +417,7 @@ void onEvent (ev_t ev) {
             SERIAL_PRINTLN(F("EV_BEACON_TRACKED"));
             break;
         case EV_JOINING:
-            SERIAL_PRINTLN(F("EV_JOINING"));
-            // Safety Net: If radio freezes, reset after 70s
-            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(70), join_watchdog_sleep);
+            SERIAL_PRINTLN(F("EV_JOINING: Stack is attempting to join..."));
             break;
         case EV_JOINED:
             SERIAL_PRINTLN(F("EV_JOINED"));
@@ -445,10 +443,9 @@ void onEvent (ev_t ev) {
             break;
 
         case EV_JOIN_FAILED:
-            // CRITICAL FIX: If we already handled EV_JOIN_TXCOMPLETE, we might have
-            // already reset the stack. We simply log here and do nothing else
-            // to prevent overwriting the 5s quick-retry with a 600s long backoff.
-            SERIAL_PRINTLN(F("EV_JOIN_FAILED (Ignored, handled in TXCOMPLETE)"));
+            SERIAL_PRINTLN(F("EV_JOIN_FAILED"));
+            SERIAL_PRINT(F("--> Native LMIC Opmode state: 0x"));
+            SERIAL_PRINTLN(LMIC.opmode, HEX);
             break;
 
         case EV_REJOIN_FAILED:
@@ -509,7 +506,7 @@ void onEvent (ev_t ev) {
         case EV_LINK_DEAD:
             SERIAL_PRINTLN(F("EV_LINK_DEAD"));
             LMIC_reset();
-            LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);
+            LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);
             APP_DISABLE_LMIC_DUTY_CYCLE();
             haveStoredSession = false;
             consecutiveLinkDeadCount++;
@@ -522,10 +519,13 @@ void onEvent (ev_t ev) {
         case 16: // EV_SCAN_FOUND
             SERIAL_PRINTLN(F("EV_SCAN_FOUND"));
             break;
-        case 17: // EV_TXSTART
-            SERIAL_PRINTLN(F("EV_TXSTART"));
-            // We set a global safety net in EV_JOINING, so we only need the App Watchdog
-            // if we are NOT joining (i.e. normal data transmission)
+            case 17: // EV_TXSTART
+            SERIAL_PRINTLN(F("EV_TXSTART (radio TX started)"));
+            SERIAL_PRINT(F("--> Freq: "));
+            SERIAL_PRINT(LMIC.freq);
+            SERIAL_PRINT(F(" Hz, DataRate: "));
+            SERIAL_PRINTLN(LMIC.datarate);
+            macStormRetryPending = false;
             if (haveStoredSession) {
                 os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(APP_WATCHDOG_AFTER_TX_SEC), app_watchdog_sleep);
             }
@@ -537,8 +537,13 @@ void onEvent (ev_t ev) {
             SERIAL_PRINTLN(F("EV_RXSTART"));
             break;
 
-        case 20: // EV_JOIN_TXCOMPLETE
-            SERIAL_PRINTLN(F("EV_JOIN_TXCOMPLETE (Join Request sent, no Accept received yet)"));
+            case 20: // EV_JOIN_TXCOMPLETE
+            SERIAL_PRINTLN(F("EV_JOIN_TXCOMPLETE (Join Request sent, no Accept received)"));
+            SERIAL_PRINT(F("--> Native LMIC Opmode state: 0x"));
+            SERIAL_PRINTLN(LMIC.opmode, HEX);
+
+            // Cancel our custom safety net watchdog
+            os_clearCallback(&sendjob);
             break;
 
         default:
@@ -991,7 +996,7 @@ void setup() {
     os_init();
     memset(&macRetryFallbackJob, 0, sizeof(macRetryFallbackJob));  /* Init before first MAC reset can occur */
     LMIC_reset();
-    LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);  /* 20% for Feather M0 internal oscillator / RX2 window */
+    LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);  /* 100% for Feather M0 internal oscillator / RX2 window */
     APP_DISABLE_LMIC_DUTY_CYCLE();  /* Application enforces 300 s sleep; LMIC duty would cause long awake-waits */
 
     if (haveStoredSession) {
@@ -1039,7 +1044,7 @@ void loop() {
         consecutivePort0Downlinks = 0;
         LMIC_reset();
         LMIC.opmode = 0;  /* Clear opmode so next wake starts clean. */
-        LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);  /* 20% for Feather M0 / RX2 window */
+        LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);  /* 1% for Feather M0 / RX2 window */
         APP_DISABLE_LMIC_DUTY_CYCLE();
         if (persistentData.runMode == RUN_MODE_DEV && hibernationRequested) {
             if (Serial) Serial.flush();
