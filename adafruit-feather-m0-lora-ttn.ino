@@ -538,24 +538,7 @@ void onEvent (ev_t ev) {
             break;
 
         case 20: // EV_JOIN_TXCOMPLETE
-            // This event means the Join Request was sent, RX1/RX2 opened,
-            // and NO Join Accept was received.
-            SERIAL_PRINTLN(F("EV_JOIN_TXCOMPLETE (Join Failed: No Accept received)"));
-
-            // 1. Cancel the safety net watchdog
-            os_clearCallback(&sendjob);
-
-            // 2. Reset the stack to ensure clean state
-            LMIC_reset();
-
-            // 3. CRITICAL: Re-apply Clock Error fix.
-            // LMIC_reset() wipes this, and without it, the M0 cannot join.
-            LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);
-            APP_DISABLE_LMIC_DUTY_CYCLE();
-
-            // 4. Retry quickly (5 seconds)
-            SERIAL_PRINTLN(F("[join] Retrying in 5s..."));
-            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(5), do_send);
+            SERIAL_PRINTLN(F("EV_JOIN_TXCOMPLETE (Join Request sent, no Accept received yet)"));
             break;
 
         default:
