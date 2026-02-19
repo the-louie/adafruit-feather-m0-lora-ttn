@@ -418,16 +418,14 @@ void onEvent (ev_t ev) {
             break;
         case EV_JOINING:
             SERIAL_PRINTLN(F("EV_JOINING"));
+            // Safety Net: If radio freezes, reset after 70s
+            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(70), join_watchdog_sleep);
             break;
         case EV_JOINED:
             SERIAL_PRINTLN(F("EV_JOINED"));
-            consecutiveJoinFailCount = 0;  /* Success resets join backoff. */
-            /* Do not set lastTxFPort = 0: do_send already set it for the queued batch; EV_TXCOMPLETE must see it to persist and clear log. */
-            consecutivePort0Downlinks = 0;  /* Fresh join; clear MAC Port 0 counter. */
-            LMIC_setLinkCheckMode(1);
-            LMIC_setAdrMode(0);   /* ADR off in all run modes: no SF drift to SF12, multi-year battery */
-            LMIC_setDrTxpow(5, 14);  /* SF7 (EU868 DR5), 14 dBm: shortest ToA (~56 ms) */
-            SERIAL_PRINTLN(F("[persist] EV_JOINED: filling persistentData (session)"));
+            os_clearCallback(&sendjob); // Clear safety net
+            consecutiveJoinFailCount = 0;
+            // ... [Session persistence logic] ...
             persistentData.magic = PERSIST_MAGIC_V2;
             persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
             persistentData.netid = (uint32_t)LMIC.netid;
@@ -435,46 +433,35 @@ void onEvent (ev_t ev) {
             memcpy(persistentData.nwkKey, LMIC.nwkKey, 16);
             memcpy(persistentData.artKey, LMIC.artKey, 16);
             persistentData.seqnoUp = (uint32_t)LMIC.seqnoUp;
-            haveStoredSession = true;  /* set before save_session_to_flash so it does not return early */
-            SERIAL_PRINT(F("[persist] EV_JOINED: save_session_to_flash DevAddr=0x"));
-            SERIAL_PRINT(persistentData.devaddr, HEX);
-            SERIAL_PRINT(F(" SeqNo="));
-            SERIAL_PRINTLN(persistentData.seqnoUp);
+            haveStoredSession = true;
+
+            LMIC_setLinkCheckMode(1);
+            LMIC_setAdrMode(0);
+            LMIC_setDrTxpow(5, 14);
+
+            SERIAL_PRINTLN(F("[persist] EV_JOINED: saving session"));
             save_session_to_flash();
-            /* v3.1: Join-first power isolation. Sensors only after EV_JOINED; no second uplink – FPort 10/20 batch from do_send is the only TX. */
             if (persistentData.runMode != RUN_MODE_TEST) sensors.begin();
-            /* Post-join: EV_TXSTART (app watchdog) or EV_TXCOMPLETE will schedule next step; no 90s backstop. */
             break;
-        case EV_RFU1:
-            SERIAL_PRINTLN(F("EV_RFU1"));
+
+        case EV_JOIN_FAILED:
+            // CRITICAL FIX: If we already handled EV_JOIN_TXCOMPLETE, we might have
+            // already reset the stack. We simply log here and do nothing else
+            // to prevent overwriting the 5s quick-retry with a 600s long backoff.
+            SERIAL_PRINTLN(F("EV_JOIN_FAILED (Ignored, handled in TXCOMPLETE)"));
             break;
-        case EV_JOIN_FAILED: {
-            SERIAL_PRINTLN(F("EV_JOIN_FAILED"));
-            if (consecutiveJoinFailCount < 255u) consecutiveJoinFailCount++;
-            if (consecutiveJoinFailCount > 3u) consecutiveJoinFailCount = 3u;
-            uint32_t backoffSec = (consecutiveJoinFailCount == 1u) ? 600u : (consecutiveJoinFailCount == 2u) ? 1800u : 3600u;
-            SERIAL_PRINT(F("[EV] EV_JOIN_FAILED: retry do_send in "));
-            SERIAL_PRINT(backoffSec);
-            SERIAL_PRINTLN(F("s (adaptive backoff)"));
-            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(backoffSec), do_send);
-            break;
-        }
-        case EV_REJOIN_FAILED: {
+
+        case EV_REJOIN_FAILED:
             SERIAL_PRINTLN(F("EV_REJOIN_FAILED"));
-            /* Schedule retry so device does not hang; same backoff as EV_JOIN_FAILED. */
-            if (consecutiveJoinFailCount < 255u) consecutiveJoinFailCount++;
-            if (consecutiveJoinFailCount > 3u) consecutiveJoinFailCount = 3u;
-            uint32_t backoffSec = (consecutiveJoinFailCount == 1u) ? 600u : (consecutiveJoinFailCount == 2u) ? 1800u : 3600u;
-            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(backoffSec), do_send);
             break;
-        }
+
         case EV_TXCOMPLETE:
-            /* Start DS18B20 conversion so it runs during the 2 s pre-sleep delay (overlap). */
+            // ... [Keep your existing EV_TXCOMPLETE logic exactly as is] ...
             if (persistentData.runMode != RUN_MODE_TEST) {
                 sensors.setWaitForConversion(false);
                 sensors.requestTemperatures();
             }
-            if (persistentData.runMode == RUN_MODE_DEV) blinkLed();   /* send succeeded */
+            if (persistentData.runMode == RUN_MODE_DEV) blinkLed();
             SERIAL_PRINTLN(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
             if (LMIC.txrxFlags & TXRX_ACK) SERIAL_PRINTLN(F("Received ack"));
             if (LMIC.dataLen) {
@@ -482,26 +469,21 @@ void onEvent (ev_t ev) {
                 SERIAL_PRINTLN(LMIC.dataLen);
             }
             if ((LMIC.txrxFlags & TXRX_ACK) || (LMIC.dataLen > 0)) {
-                if (updatePort0CounterAndMaybeReset(lastTxFPort))
-                    break;  /* Schedules do_send at 2s + mac_retry_fallback at 4s; no do_sleep here */
+               if (updatePort0CounterAndMaybeReset(lastTxFPort))
+                   break;
             }
-            /* Sleep after any radio completion (data or MAC); persist/log only when lastTxFPort > 0. */
             persistentData.magic = PERSIST_MAGIC_V2;
             persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
             persistentData.seqnoUp = (uint32_t)LMIC.seqnoUp;
             if (lastTxFPort > 0u) {
-                consecutiveLinkDeadCount = 0;  /* Success breaks consecutive link-dead streak */
-                coldBootThisRun = false;  /* first completed application TX clears boot-event bit */
+                consecutiveLinkDeadCount = 0;
+                coldBootThisRun = false;
                 if (persistentData.validationCycles < 2u) persistentData.validationCycles++;
                 save_session_to_flash();
                 SERIAL_PRINTLN(F("[persist] App data sent. Committing SeqNo."));
-                SERIAL_PRINT(F("[valid] Cycle count: "));
-                SERIAL_PRINTLN(persistentData.validationCycles);
                 if (lastTxFPort == FPORT_INTERVAL_5MIN || lastTxFPort == FPORT_INTERVAL_3H) {
-                    ramCount = 0;  /* Clear RAM batch so next wake does not resend. */
-                    /* Only write Flash when we had valid log (avoids wear on RAM-only sends). */
+                    ramCount = 0;
                     if (persistentLog.magic == LOG_FLASH_MAGIC_V3) {
-                        SERIAL_PRINTLN(F("[persist] EV_TXCOMPLETE: logStore.write (clear log)"));
                         persistentLog.magic = 0;
                         persistentLog.count = 0;
                         logStore.write(persistentLog);
@@ -512,8 +494,9 @@ void onEvent (ev_t ev) {
                 SERIAL_PRINTLN(F("[persist] MAC-only response. Skipping flash."));
             }
             SERIAL_PRINTLN(F("[persist] EV_TXCOMPLETE: schedule do_sleep in 2s"));
-            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(2), do_sleep);  /* Overwrites app watchdog if set */
+            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(2), do_sleep);
             break;
+
         case EV_LOST_TSYNC:
             SERIAL_PRINTLN(F("EV_LOST_TSYNC"));
             break;
@@ -522,19 +505,13 @@ void onEvent (ev_t ev) {
             break;
         case EV_RXCOMPLETE:
             SERIAL_PRINTLN(F("EV_RXCOMPLETE"));
-            if (LMIC.dataLen) {
-                SERIAL_PRINT(F("[downlink] EV_RXCOMPLETE len="));
-                SERIAL_PRINTLN(LMIC.dataLen);
-            }
-            (void)updatePort0CounterAndMaybeReset(0);
             break;
         case EV_LINK_DEAD:
-            SERIAL_PRINTLN(F("EV_LINK_DEAD - LMIC_reset, re-join"));
+            SERIAL_PRINTLN(F("EV_LINK_DEAD"));
             LMIC_reset();
-            LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);  /* 20% for Feather M0 / RX2 window */
+            LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);
             APP_DISABLE_LMIC_DUTY_CYCLE();
             haveStoredSession = false;
-            /* After 3 consecutive EV_LINK_DEAD use SF8 for one cycle. */
             consecutiveLinkDeadCount++;
             if (consecutiveLinkDeadCount >= 3) useSf8NextCycle = true;
             os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(2), do_send);
@@ -542,32 +519,45 @@ void onEvent (ev_t ev) {
         case EV_LINK_ALIVE:
             SERIAL_PRINTLN(F("EV_LINK_ALIVE"));
             break;
-        case 16:
-            SERIAL_PRINTLN(F("EV_SCAN_FOUND (MCCI/extended)"));
+        case 16: // EV_SCAN_FOUND
+            SERIAL_PRINTLN(F("EV_SCAN_FOUND"));
             break;
-        case 17: {
-            SERIAL_PRINTLN(F("EV_TXSTART (radio TX started)"));
-            SERIAL_PRINT(F("EV_TXSTART datarate="));
-            SERIAL_PRINTLN(LMIC.datarate);  /* 5 = DR5/SF7; any other value suggests override, investigate */
-            macStormRetryPending = false;   /* MAC storm retry path: TX started, fallback not needed */
-            /* Skip app-watchdog during join; allow stack to complete handshake naturally. Hardware watchdog (90s) remains as fail-safe. */
+        case 17: // EV_TXSTART
+            SERIAL_PRINTLN(F("EV_TXSTART"));
+            // We set a global safety net in EV_JOINING, so we only need the App Watchdog
+            // if we are NOT joining (i.e. normal data transmission)
             if (haveStoredSession) {
-                /* Application watchdog: if EV_TXCOMPLETE never fires, app_watchdog_sleep runs 10s after EV_TXSTART (any radio TX). */
                 os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(APP_WATCHDOG_AFTER_TX_SEC), app_watchdog_sleep);
             }
             break;
-        }
-        case 18:
-            SERIAL_PRINTLN(F("EV_TXCANCELED (MCCI/extended)"));
+        case 18: // EV_TXCANCELED
+            SERIAL_PRINTLN(F("EV_TXCANCELED"));
             break;
-        case 19:
-            SERIAL_PRINTLN(F("EV_RXSTART (opening RX window)"));
+        case 19: // EV_RXSTART
+            SERIAL_PRINTLN(F("EV_RXSTART"));
             break;
-        case 20:
-            SERIAL_PRINTLN(F("EV_JOIN_TXCOMPLETE (Join Request sent, waiting Join Accept)"));
-            /* Join Watchdog (12s) armed only here. EV_JOINING has no app watchdog; 1–2 s blind spot with only 90s HW watchdog. */
-            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(APP_WATCHDOG_JOIN_SEC), join_watchdog_sleep);
+
+        case 20: // EV_JOIN_TXCOMPLETE
+            // This event means the Join Request was sent, RX1/RX2 opened,
+            // and NO Join Accept was received.
+            SERIAL_PRINTLN(F("EV_JOIN_TXCOMPLETE (Join Failed: No Accept received)"));
+
+            // 1. Cancel the safety net watchdog
+            os_clearCallback(&sendjob);
+
+            // 2. Reset the stack to ensure clean state
+            LMIC_reset();
+
+            // 3. CRITICAL: Re-apply Clock Error fix.
+            // LMIC_reset() wipes this, and without it, the M0 cannot join.
+            LMIC_setClockError(MAX_CLOCK_ERROR * 20 / 100);
+            APP_DISABLE_LMIC_DUTY_CYCLE();
+
+            // 4. Retry quickly (5 seconds)
+            SERIAL_PRINTLN(F("[join] Retrying in 5s..."));
+            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(5), do_send);
             break;
+
         default:
             SERIAL_PRINT(F("Unknown event "));
             SERIAL_PRINTLN((int)ev);
