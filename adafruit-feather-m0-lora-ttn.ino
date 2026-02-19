@@ -10,7 +10,7 @@ typedef struct LogEntryS AppLogEntry;
 /* No-op when LMIC does not provide LMIC_disableDutyCycle. To enable duty-cycle bypass, use a library that provides it and replace with LMIC_disableDutyCycle(). */
 #define APP_DISABLE_LMIC_DUTY_CYCLE() ((void)0)
 
-/* Firmware v3.5 – Hardware-strapped run mode (pins 11/12 GND-strap). Single binary; 0 µA pin leakage after read; reset-cause filtering (PM->RCAUSE). v3.3.2: Join-first uplink includes one reading; direct-from-RAM when SEND_PERIOD_MEASURES==1 and no backlog. v3.4: Cold boot always uplink with data; if no flash backlog, one temperature measurement is taken and sent; first wake after cold boot may take longer. v3.5: USB cold-boot override – when powered from USB at cold boot, run mode is forced to DEV for that boot without writing to Flash (Live Boot; reverts to straps on battery). */
+/* Firmware v3.5 – Hardware-strapped run mode (pins 11/12 GND-strap). Single binary; 0 µA pin leakage after read; reset-cause filtering (PM->RCAUSE). v3.3.2: Join-first uplink includes one reading; direct-from-RAM when SEND_PERIOD_MEASURES==1 and no backlog. v3.4: Obsolete (cold-boot sensor path removed; do_send never reads sensors; unjoined path sends 4-byte header from do_wake). v3.5: USB cold-boot override – when powered from USB at cold boot, run mode is forced to DEV for that boot without writing to Flash (Live Boot; reverts to straps on battery). */
 
 /*******************************************************************************
  * Copyright (c) 2015 Thomas Telkamp and Matthijs Kooijman
@@ -45,13 +45,11 @@ typedef struct LogEntryS AppLogEntry;
  *
  * Batched log (c) 2026 by the_louie, v3.1 Clean-Join:
  *  - On each wake: measure, append to RAM (newest at index 0); on send wake merge RAM to Flash, uplink on FPort 10 (300 s) or 20 (10800 s); on success clear Flash. After join, only this batch is sent (no post-join HELLO).
- *  - Payload: 4-byte header [vbat×100][flags][sequence] then 2×n temperature. Flags bit0 = watchdog, bit1 = cold boot. Time from gateway received_at; decoder uses FPort for interval.
+ *  - Payload: 4-byte header [vbat×100][flags][sequence] then 2×n temperature. Flags bit0 = watchdog. Time from gateway received_at; decoder uses FPort for interval.
  *  - Session saved on join, restored on wake.
  *
- * TTN / LMIC behaviour: Duty cycle disabled; 5-min sleep cycle enforces EU868. Zero-Trust watchdog: if awake exceeds budget (30 s data / 90 s join / 15 s low VBat), force LMIC_reset and do_sleep; optional Watchdog Bit in payload (flags bit0) for TTN visibility.
- * App watchdog: 10s after EV_TXSTART (when haveStoredSession; not during join) or 12s after EV_JOIN_TXCOMPLETE (join), if completion never fires, force do_sleep. do_sleep: persist only when lastTxFPort>0 or watchdog (bypass for pure MAC).
- * SF7 default, ADR off. All uplinks Unconfirmed (no ACK/retries).
- * 5% clock error (Feather M0 oscillator / RX2 window). SeqNo persisted in EV_TXCOMPLETE only when completed TX was application data (FPort > 0); MAC-only completions skip flash. do_sleep does not wait for radio idle (proactive hand-off); session saved when send cycle complete. App watchdog 10s when haveStoredSession; not armed during join. When unjoined, do_sleep yields to os_runloop_once(). Link Check on after join. EV_LINK_DEAD triggers LMIC_reset and re-join. do_send allows at most one 10 s reschedule when OP_TXRXPEND (with session); on second blocked attempt forces sleep. RX2 from Join Accept.
+ * TTN / LMIC behaviour: Duty cycle disabled; 5-min sleep cycle enforces EU868. Zero-Trust watchdog: always on (5-minutes when unjoined, 30s when joined); if awake exceeds budget force LMIC_reset and do_sleep; optional Watchdog Bit in payload (flags bit0). App watchdog: 10s after EV_TXSTART (when haveStoredSession), if completion never fires, force do_sleep. do_sleep: when unjoined schedules do_send in 15 s; persist only when lastTxFPort>0 or watchdog (bypass for pure MAC). EV_JOIN_TXCOMPLETE and EV_JOIN_FAILED schedule native app retries. OP_TXRXPEND reschedules every 10 s infinitely without forcing sleep. do_send never performs sensor reads.
+ * SF7 default, ADR off. All uplinks Unconfirmed (no ACK/retries). 5% clock error (Feather M0 oscillator / RX2 window). SeqNo persisted in EV_TXCOMPLETE only when completed TX was application data (FPort > 0); MAC-only completions skip flash. do_sleep does not wait for radio idle (proactive hand-off); session saved when send cycle complete. Link Check on after join. EV_LINK_DEAD triggers LMIC_reset and re-join. RX2 from Join Accept.
  *
  * If updates stop: (1) TTN Live Data: "Join Request without Join Accept" = timing/clock;
  * "Uplink dropped" = frame counter. (2) Confirm DIO1 (RFM95) to pin 6 (M0); without it no RX.
@@ -104,7 +102,6 @@ DallasTemperature sensors(&oneWire);
 
 /* Application watchdog: if EV_TXCOMPLETE never fires (e.g. MAC/stack absorbs event), force do_sleep. */
 #define APP_WATCHDOG_AFTER_TX_SEC 10u  /* Data/MAC TX: 10s after EV_TXSTART. Covers standard RX1 (1s/5s) and RX2 (2s/6s) windows with margin. */
-#define APP_WATCHDOG_JOIN_SEC 12u      /* Join: 12s after EV_JOIN_TXCOMPLETE (RX1+RX2+Feather M0 processing margin) */
 
 /* Serial only when runMode == RUN_MODE_DEV (runtime); Serial.begin() called only in setup when DEV. Single binary. */
 #define SERIAL_PRINT(...)    do { if (persistentData.runMode == RUN_MODE_DEV) Serial.print(__VA_ARGS__); } while(0)
@@ -171,32 +168,25 @@ void os_getDevKey (u1_t* buf) { memcpy_P(buf, APPKEY, 16);}
 static osjob_t sendjob;
 static bool haveStoredSession;
 
-/** OP_TXRXPEND: at most one 10 s reschedule of do_send when session exists; on second blocked attempt we force sleep. When !haveStoredSession (commissioning) we reschedule in 10 s without forcing sleep. */
-#define DO_SEND_PEND_RESCHEDULE_MAX 1
-static uint8_t do_send_pend_retries;
-
 /** Zero-Trust watchdog: MCU forces sleep when millis() exceeds this deadline regardless of radio state. */
 #define MAX_AWAKE_TIME_MS      30000   /* 30 s for data uplinks */
-#define MAX_AWAKE_JOIN_MS     300000  /* 5 minutes to allow native LMIC duty-cycle backoffs */
 #define MAX_AWAKE_LOW_VBAT_MS 15000   /* 15 s when VBat < 3.4 V */
 static uint32_t wakeDeadlineMs = 0;
 /** Set when watchdog forces sleep; included in next batch payload (flags byte bit0), then cleared. */
 static bool watchdogTriggeredLastWake = false;
 
-/** Adaptive join backoff: EV_JOIN_FAILED retry delay 10 min / 30 min / 1 h (RAM-only, reset on EV_JOINED). */
-static uint8_t consecutiveJoinFailCount = 0;
-
-/** Set wake deadline for this wake cycle (join vs data, VBat-aware). Zero-Trust awake budget. */
-static void setWakeDeadline(bool isJoinPhase, float vbatV) {
-    uint32_t ms = (vbatV < VBAT_LOW_THRESHOLD_V) ? MAX_AWAKE_LOW_VBAT_MS
-                  : (isJoinPhase ? MAX_AWAKE_JOIN_MS : MAX_AWAKE_TIME_MS);
+/** Set wake deadline for this wake cycle. When unjoined: 5 min to allow LMIC backoffs; when joined: VBat-aware (30 s / 15 s low). */
+static void setWakeDeadline(float vbatV) {
+    uint32_t ms;
+    if (!haveStoredSession)
+        ms = 300000;  /* 5 minutes when unjoined */
+    else
+        ms = (vbatV < VBAT_LOW_THRESHOLD_V) ? MAX_AWAKE_LOW_VBAT_MS : MAX_AWAKE_TIME_MS;
     wakeDeadlineMs = millis() + ms;
 }
 
 /** FPort of last application TX (batch=10/20). Set in do_send before LMIC_setTxData2; do not clear in EV_JOINED so first post-join TX completion triggers persist and do_sleep. MAC-only (Port 0) completions do not set this; we only persist to flash when lastTxFPort > 0. */
 static uint8_t lastTxFPort;
-/** Set true at boot; cleared after first successful batch TX. Flags bit 1 in payload (cold boot/reset). */
-static bool coldBootThisRun = true;
 
 /* Runtime interval/FPort/USB from configureIntervals(persistentData.runMode); set in setup(). */
 static uint32_t currentMeasureInterval = 10800u;   /* seconds; PROD default until configureIntervals runs */
@@ -212,7 +202,6 @@ void do_wake(osjob_t* j);  /* measure, append, then backup+send or sleep */
 void do_send(osjob_t* j);
 void do_sleep(osjob_t* j);
 static void app_watchdog_sleep(osjob_t* j);   /* 10s after EV_TXSTART (when haveStoredSession) if EV_TXCOMPLETE never fired */
-static void join_watchdog_sleep(osjob_t* j);  /* 12s after EV_JOIN_TXCOMPLETE if EV_JOINED/EV_JOIN_FAILED never fired */
 
 /** Commit session to flash. updateSeqnoFromLmic: when false, do not overwrite seqnoUp from LMIC (use after watchdog so LMIC_reset does not corrupt stored seqnoUp). Call sites: EV_JOINED; EV_TXCOMPLETE when last TX was application; do_sleep when measuresInPeriod==0 && lastTxFPort>0 && seqnoUp increased or when watchdogTriggeredLastWake; app_watchdog_sleep (false). */
 static void save_session_to_flash(bool updateSeqnoFromLmic = true) {
@@ -305,7 +294,7 @@ static void app_watchdog_sleep(osjob_t* j) {
     if (haveStoredSession)
         save_session_to_flash(false);
     LMIC_reset();
-    LMIC_setClockError(MAX_CLOCK_ERROR * CLOCK_ERROR_PERCENT / 100);
+    LMIC_setClockError((uint32_t)MAX_CLOCK_ERROR * CLOCK_ERROR_PERCENT / 100);
     APP_DISABLE_LMIC_DUTY_CYCLE();
     if (haveStoredSession) {
         LMIC_setSession(persistentData.netid, (u4_t)persistentData.devaddr, persistentData.nwkKey, persistentData.artKey);
@@ -315,17 +304,6 @@ static void app_watchdog_sleep(osjob_t* j) {
     }
     watchdogTriggeredLastWake = true;  /* do_sleep will persist and set payload flag on next TX */
     os_setTimedCallback(&sendjob, os_getTime(), do_sleep);
-}
-
-/** Join-phase watchdog: EV_JOINED/EV_JOIN_FAILED never arrived. Do NOT sleep; reset MAC and retry immediately. */
-static void join_watchdog_sleep(osjob_t* j) {
-    (void)j;
-    SERIAL_PRINTLN(F("[join] Join Accept missed (watchdog), retrying immediately..."));
-    LMIC_reset();
-    LMIC_setClockError(MAX_CLOCK_ERROR * CLOCK_ERROR_PERCENT / 100);
-    APP_DISABLE_LMIC_DUTY_CYCLE();
-    LMIC_setDrTxpow(5, 14);  /* SF7 for join retry */
-    os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(5), do_send);
 }
 
 void onEvent (ev_t ev) {
@@ -349,8 +327,7 @@ void onEvent (ev_t ev) {
             break;
         case EV_JOINED:
             SERIAL_PRINTLN(F("EV_JOINED"));
-            os_clearCallback(&sendjob); // Clear safety net
-            consecutiveJoinFailCount = 0;
+            os_clearCallback(&sendjob);
             persistentData.magic = PERSIST_MAGIC_V2;
             persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
             persistentData.netid = (uint32_t)LMIC.netid;
@@ -359,20 +336,19 @@ void onEvent (ev_t ev) {
             memcpy(persistentData.artKey, LMIC.artKey, 16);
             persistentData.seqnoUp = (uint32_t)LMIC.seqnoUp;
             haveStoredSession = true;
-
             LMIC_setLinkCheckMode(1);
             LMIC_setAdrMode(0);
             LMIC_setDrTxpow(5, 14);
 
             SERIAL_PRINTLN(F("[persist] EV_JOINED: saving session"));
             save_session_to_flash();
-            if (persistentData.runMode != RUN_MODE_TEST) sensors.begin();
             break;
 
         case EV_JOIN_FAILED:
             SERIAL_PRINTLN(F("EV_JOIN_FAILED"));
             SERIAL_PRINT(F("--> Native LMIC Opmode state: 0x"));
             SERIAL_PRINTLN(LMIC.opmode, HEX);
+            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(15), do_send);
             break;
 
         case EV_REJOIN_FAILED:
@@ -395,7 +371,6 @@ void onEvent (ev_t ev) {
             persistentData.devEuiTag = (uint64_t)LORAWAN_DEV_EUI;
             persistentData.seqnoUp = (uint32_t)LMIC.seqnoUp;
             if (lastTxFPort > 0u) {
-                coldBootThisRun = false;
                 if (persistentData.validationCycles < 2u) persistentData.validationCycles++;
                 save_session_to_flash();
                 SERIAL_PRINTLN(F("[persist] App data sent. Committing SeqNo."));
@@ -427,7 +402,7 @@ void onEvent (ev_t ev) {
         case EV_LINK_DEAD:
             SERIAL_PRINTLN(F("EV_LINK_DEAD"));
             LMIC_reset();
-            LMIC_setClockError(MAX_CLOCK_ERROR * CLOCK_ERROR_PERCENT / 100);
+            LMIC_setClockError((uint32_t)MAX_CLOCK_ERROR * CLOCK_ERROR_PERCENT / 100);
             APP_DISABLE_LMIC_DUTY_CYCLE();
             LMIC_setDrTxpow(5, 14);  /* SF7 for re-join */
             haveStoredSession = false;
@@ -439,7 +414,7 @@ void onEvent (ev_t ev) {
         case 16: // EV_SCAN_FOUND
             SERIAL_PRINTLN(F("EV_SCAN_FOUND"));
             break;
-            case 17: // EV_TXSTART
+        case 17: // EV_TXSTART
             SERIAL_PRINTLN(F("EV_TXSTART (radio TX started)"));
             SERIAL_PRINT(F("--> Freq: "));
             SERIAL_PRINT(LMIC.freq);
@@ -455,14 +430,11 @@ void onEvent (ev_t ev) {
         case 19: // EV_RXSTART
             SERIAL_PRINTLN(F("EV_RXSTART"));
             break;
-
-            case 20: // EV_JOIN_TXCOMPLETE
+        case 20: // EV_JOIN_TXCOMPLETE
             SERIAL_PRINTLN(F("EV_JOIN_TXCOMPLETE (Join Request sent, no Accept received)"));
             SERIAL_PRINT(F("--> Native LMIC Opmode state: 0x"));
             SERIAL_PRINTLN(LMIC.opmode, HEX);
-
-            // Cancel our custom safety net watchdog
-            os_clearCallback(&sendjob);
+            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(30), do_send);
             break;
 
         default:
@@ -483,7 +455,7 @@ static uint16_t encodeTemperatureHighRes(float tempC) {
     return (uint16_t)v;
 }
 
-/** Build payload from RAM then Flash (newest-first). 4-byte header [VBat_Hi,VBat_Lo][Flags][Sequence] then 2×n temp. Flags: bit0=watchdog, bit1=cold boot. Sequence = wakeCounter & 0xFF. No local AppLogEntry array; Flash entries only when caller passes flashN from magic-valid log. */
+/** Build payload from RAM then Flash (newest-first). 4-byte header [VBat_Hi,VBat_Lo][Flags][Sequence] then 2×n temp. Flags: bit0=watchdog. Sequence = wakeCounter & 0xFF. No local AppLogEntry array; Flash entries only when caller passes flashN from magic-valid log. */
 static uint16_t buildBatchPayloadTwoSources(uint8_t* buf, uint16_t vbatCentivolt, uint8_t flagsByte, uint8_t sequenceByte,
     const AppLogEntry* ramEntries, uint8_t ramN, const AppLogEntry* flashEntries, uint8_t flashN) {
     uint16_t i = 0;
@@ -509,26 +481,11 @@ void do_send(osjob_t* j) {
     (void)j;
     SERIAL_PRINTLN(F("[send] do_send entry"));
     /* Each path below calls os_setTimedCallback for sendjob or leaves the job to be driven by LMIC events; previous timers on sendjob are overwritten by the next schedule. */
-    /* Clean state: after app watchdog the radio was purged (LMIC_reset + session restore) so a re-send will not hang on OP_TXRXPEND. Log cleared only in EV_TXCOMPLETE. */
     if (LMIC.opmode & OP_TXRXPEND) {
-        /* Commissioning priority: do not force sleep on busy radio if session is not yet established. */
-        if (!haveStoredSession) {
-            SERIAL_PRINTLN(F("[send] OP_TXRXPEND, reschedule do_send in 10s (commissioning)"));
-            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(10), do_send);
-            return;
-        }
-        do_send_pend_retries++;
-        if (do_send_pend_retries <= DO_SEND_PEND_RESCHEDULE_MAX) {
-            SERIAL_PRINTLN(F("[send] OP_TXRXPEND, reschedule do_send in 10s"));
-            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(10), do_send);
-        } else {
-            SERIAL_PRINTLN(F("[send] Radio busy, forcing sleep to save battery"));
-            do_send_pend_retries = 0;  /* next wake gets one reschedule again */
-            os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(0), do_sleep);
-        }
+        SERIAL_PRINTLN(F("[send] OP_TXRXPEND, waiting..."));
+        os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(10), do_send);
         return;
     }
-    do_send_pend_retries = 0;
 
     uint16_t vbatCentivolt = (uint16_t)(VBAT_VOLTS() * 100.0f);
     /* Merge RAM into Flash so batch includes backlog; normal path already merged in do_wake. May early-return when Flash empty and SEND_PERIOD_MEASURES==1. */
@@ -537,27 +494,7 @@ void do_send(osjob_t* j) {
     uint8_t flashCount = (persistentLog.magic == LOG_FLASH_MAGIC_V3 && persistentLog.count <= LOG_ENTRIES_MAX)
         ? persistentLog.count : 0;
 
-    /* Defensive: cold boot with no backlog – take one reading so backend sees boot_event with data (same encode path as do_wake). */
-    if (coldBootThisRun && ramCount == 0u && flashCount == 0u) {
-        float tempC;
-        if (persistentData.runMode == RUN_MODE_TEST) {
-            tempC = (float)NAN;
-            (void)tempC;
-        } else {
-            sensors.setWaitForConversion(false);
-            sensors.requestTemperatures();
-            uint32_t startMs = millis();
-            while (!sensors.isConversionComplete() && (millis() - startMs < (uint32_t)DS18B20_READ_TIMEOUT_MS))
-                delay(50);
-            tempC = (millis() - startMs < (uint32_t)DS18B20_READ_TIMEOUT_MS) ? sensors.getTempCByIndex(0) : (float)NAN;
-        }
-        AppLogEntry e;
-        e.temperature = (persistentData.runMode == RUN_MODE_TEST) ? 0xFFFFu : encodeTemperatureHighRes(tempC);
-        dataBuffer[0] = e;
-        ramCount = 1u;
-    }
-
-    uint8_t flagsByte = (watchdogTriggeredLastWake ? 1u : 0u) | (coldBootThisRun ? 2u : 0u);
+    uint8_t flagsByte = (watchdogTriggeredLastWake ? 1u : 0u);
     if (watchdogTriggeredLastWake) watchdogTriggeredLastWake = false;
     uint8_t sequenceByte = (uint8_t)(persistentData.wakeCounter & 0xFF);
     uint8_t paybuf[4 + 2 * LOG_SEND_CAP];
@@ -617,7 +554,7 @@ static void mergeBackupAndPrepareSend(void) {
 /** Capture wake start for delta-sleep. Set at very start of do_wake. */
 static uint32_t wakeStartMs;
 
-/** Called after each wake (from setup or after do_sleep). Critical VBat check first; then measure, append to RAM (newest at index 0), then either join-first do_send or session period logic. When coldBootThisRun is true and the device has a session, the send path is forced so the first wake always uplinks data. */
+/** Called after each wake (from setup or after do_sleep). Critical VBat check first; when unjoined, do_send (4-byte header) and return. Otherwise measure, append to RAM, then session period logic (merge+send or sleep). */
 void do_wake(osjob_t* j) {
     (void)j;
     wakeStartMs = millis();
@@ -629,12 +566,19 @@ void do_wake(osjob_t* j) {
     }
     SERIAL_PRINTLN(F("[wake] do_wake entry"));
     float vbatV = VBAT_VOLTS();
-    setWakeDeadline(!haveStoredSession, vbatV);  /* Zero-Trust awake budget for this wake cycle */
+    setWakeDeadline(vbatV);
 
     /* Critical VBat check before sensor read: avoid ~750 ms and ~1 mA DS18B20 when already in brown-out danger. */
     if (vbatV < VBAT_CRITICAL_THRESHOLD_V) {
         SERIAL_PRINTLN(F("[wake] Critical VBat, skip sensor and send, 600 s sleep"));
         do_sleep(&sendjob);
+        return;
+    }
+
+    if (!haveStoredSession) {
+        persistentData.wakeCounter++;
+        SERIAL_PRINTLN(F("[wake] No session, initiating join"));
+        do_send(&sendjob);
         return;
     }
 
@@ -669,14 +613,6 @@ void do_wake(osjob_t* j) {
         dataBuffer[0] = e;
     }
 
-    /* Join-first path: wakeCounter++ before do_send so Join-Uplink carries unique sequence (avoids Sequence 0 conflicts on reboot). */
-    if (!haveStoredSession) {
-        persistentData.wakeCounter++;
-        SERIAL_PRINTLN(F("[wake] No session, join-first: do_send with one reading"));
-        do_send(&sendjob);
-        return;
-    }
-
     /* Session path: period logic, then merge+send or sleep. */
     uint8_t period = persistentData.measuresInPeriod % SEND_PERIOD_MEASURES;
     period = (period + 1) % SEND_PERIOD_MEASURES;
@@ -695,14 +631,6 @@ void do_wake(osjob_t* j) {
     SERIAL_PRINT(F(" Temp="));
     SERIAL_PRINTLN(tempC);
 
-    /* Cold boot: always uplink data so backend can verify hardware stack; we already have one reading in RAM. */
-    if (coldBootThisRun) {
-        SERIAL_PRINTLN(F("[wake] Cold boot: merge then do_send"));
-        mergeBackupAndPrepareSend();
-        do_send(&sendjob);
-        return;
-    }
-
     if (period == 0) {
         SERIAL_PRINTLN(F("[wake] period==0 -> mergeBackupAndPrepareSend then do_send"));
         mergeBackupAndPrepareSend();
@@ -717,6 +645,11 @@ void do_wake(osjob_t* j) {
 void do_sleep(osjob_t* j) {
     (void)j;
     SERIAL_PRINTLN(F("[sleep] do_sleep entry"));
+    if (!haveStoredSession) {
+        SERIAL_PRINTLN(F("[sleep] Unjoined: Scheduling rapid retry"));
+        os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(15), do_send);
+        return;
+    }
     bool afterWatchdog = watchdogTriggeredLastWake;  /* capture before persist block may clear it */
     SERIAL_PRINTLN(F("[sleep] Standby start @ millis="));
     SERIAL_PRINTLN(millis());
@@ -739,12 +672,10 @@ void do_sleep(osjob_t* j) {
         delay(10);  /* allow any prior NVM write to complete before deep sleep (SAMD21) */
 
     float vbatV = VBAT_VOLTS();
-    /* Critical: 600 s; low: double interval with delta-sleep. Normal: delta sleep (interval - awake). Unjoined: short backoff so we retry quickly. */
+    /* Critical: 600 s; low: double interval with delta-sleep. Normal: delta sleep (interval - awake). */
     uint32_t intervalMs = currentMeasureInterval * 1000UL;
     uint32_t effectiveSleepMs;
-    if (!haveStoredSession) {
-        effectiveSleepMs = 15000UL;  /* 15 s: rapid join retry when unjoined */
-    } else if (vbatV < VBAT_CRITICAL_THRESHOLD_V) {
+    if (vbatV < VBAT_CRITICAL_THRESHOLD_V) {
         effectiveSleepMs = 600000UL;  /* 10 min */
     } else if (vbatV < VBAT_LOW_THRESHOLD_V) {
         uint32_t lowVbatIntervalMs = intervalMs * 2;
@@ -761,12 +692,7 @@ void do_sleep(osjob_t* j) {
     }
     /* watchdogTriggeredLastWake cleared in do_send when building payload flags so next TX carries watchdog bit. */
 
-    if (!haveStoredSession) {
-        SERIAL_PRINTLN(F("[sleep] Unjoined: Yielding completely to os_runloop_once()"));
-        return;
-    }
-
-    /* Standard sleep logic runs only when haveStoredSession. */
+    /* Standard sleep logic (haveStoredSession already enforced at top of do_sleep). */
     if (persistentData.runMode == RUN_MODE_DEV) {
     SERIAL_PRINT(F("[DEV] Entering sleep wait — "));
     SERIAL_PRINT(effectiveSleepMs / 1000UL);
@@ -850,7 +776,6 @@ void setup() {
     SERIAL_PRINT(F("Starting VBat="));
     SERIAL_PRINTLN(VBAT_VOLTS());
     lastTxFPort = 0;
-    coldBootThisRun = true;
     SERIAL_PRINT(F("[setup] sizeof(AppLogEntry)="));
     SERIAL_PRINTLN((unsigned)sizeof(AppLogEntry));
     SERIAL_PRINT(F("[setup] seqnoUp from flash: "));
@@ -880,10 +805,11 @@ void setup() {
     SERIAL_PRINT(F("Wake #"));
     SERIAL_PRINTLN(persistentData.wakeCounter);
 
-    SERIAL_PRINTLN(F("[setup] os_init LMIC_reset LMIC_setClockError"));
+    SERIAL_PRINTLN(F("[setup] SPI.begin os_init LMIC_reset LMIC_setClockError"));
+    SPI.begin();
     os_init();
     LMIC_reset();
-    LMIC_setClockError(MAX_CLOCK_ERROR * CLOCK_ERROR_PERCENT / 100);
+    LMIC_setClockError((uint32_t)MAX_CLOCK_ERROR * CLOCK_ERROR_PERCENT / 100);
     APP_DISABLE_LMIC_DUTY_CYCLE();  /* Application enforces 300 s sleep; LMIC duty would cause long awake-waits */
 
     if (haveStoredSession) {
@@ -909,21 +835,21 @@ void setup() {
     if (persistentData.runMode != RUN_MODE_TEST)
         sensors.begin();
     ramCount = 0;
-    setWakeDeadline(!haveStoredSession, VBAT_VOLTS());
+    setWakeDeadline(VBAT_VOLTS());
     do_wake(&sendjob);
 }
 
 void loop() {
     os_runloop_once();
-    /* Rollover-safe: signed delta for 30–90 s windows. */
-    if (haveStoredSession && wakeDeadlineMs != 0 && (int32_t)(millis() - wakeDeadlineMs) >= 0) {
+    /* Rollover-safe: signed delta for 30 s / 15 s low-VBat awake windows. */
+    if (wakeDeadlineMs != 0 && (int32_t)(millis() - wakeDeadlineMs) >= 0) {
         watchdogTriggeredLastWake = true;
         SERIAL_PRINTLN(F("[watchdog] AWAKE LIMIT REACHED. Forcing sleep."));
         if (persistentData.runMode == RUN_MODE_DEV && Serial) Serial.flush();
         /* Session/wakeCounter persisted in do_sleep with save_session_to_flash(false) to avoid overwriting seqnoUp after LMIC_reset. */
         LMIC_reset();
         LMIC.opmode = 0;  /* Clear opmode so next wake starts clean. */
-        LMIC_setClockError(MAX_CLOCK_ERROR * CLOCK_ERROR_PERCENT / 100);
+        LMIC_setClockError((uint32_t)MAX_CLOCK_ERROR * CLOCK_ERROR_PERCENT / 100);
         APP_DISABLE_LMIC_DUTY_CYCLE();
         os_setTimedCallback(&sendjob, os_getTime(), do_sleep);
         wakeDeadlineMs = millis() + 60000;  /* prevent re-trigger until do_sleep runs */
